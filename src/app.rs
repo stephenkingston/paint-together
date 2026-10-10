@@ -298,6 +298,8 @@ pub struct PaintApp {
     file_meta: Option<(u64, Option<std::time::SystemTime>)>,
 
     cursor: Option<(i32, i32)>,
+    /// A tool drawn as the mouse pointer this frame, with the pointer's screen position.
+    tool_cursor: Option<(Icon, Pos2)>,
     rng: u64,
     title: String,
     paste_key_was_down: bool,
@@ -384,6 +386,7 @@ impl PaintApp {
             edit_colors: None,
             file_meta: None,
             cursor: None,
+            tool_cursor: None,
             rng: 0x9E37_79B9_7F4A_7C15,
             title: String::new(),
             paste_key_was_down: false,
@@ -1315,6 +1318,7 @@ impl PaintApp {
             (moves, i.pointer.latest_pos(), i.modifiers.shift, pressed, i.stable_dt)
         });
 
+        self.tool_cursor = None;
         if matches!(self.op, Op::Idle) {
             self.hover_cursor(ctx, hover, crect);
             let (Some(hp), Some(button)) = (hover, pressed) else { return };
@@ -1350,7 +1354,12 @@ impl PaintApp {
                 self.update(&pts, shift, dt);
             }
         }
+        let stroke_pointer = matches!(self.op, Op::Stroke { .. }).then(|| tool_pointer(self.tool)).flatten();
+        if let (Some(icon), Some(p)) = (stroke_pointer, latest) {
+            self.tool_cursor = Some((icon, p));
+        }
         ctx.set_cursor_icon(match &self.op {
+            _ if self.tool_cursor.is_some() => CursorIcon::None,
             Op::MovingSel { .. } | Op::ShapeMove { .. } => CursorIcon::Move,
             Op::ShapeHandle { handle, .. } => live_shape::handle_cursor(self.shape == ShapeKind::Line, *handle),
             Op::TextMove { .. } => CursorIcon::Move,
@@ -1364,7 +1373,7 @@ impl PaintApp {
         }
     }
 
-    fn hover_cursor(&self, ctx: &Context, hover: Option<Pos2>, crect: Rect) {
+    fn hover_cursor(&mut self, ctx: &Context, hover: Option<Pos2>, crect: Rect) {
         let Some(hp) = hover else { return };
         if let (Tool::Text, Some(tb)) = (self.tool, &self.text) {
             let p = pos2((hp.x - crect.min.x) / self.zoom, (hp.y - crect.min.y) / self.zoom);
@@ -1395,6 +1404,11 @@ impl PaintApp {
             return;
         }
         if !crect.contains(hp) {
+            return;
+        }
+        if let Some(icon) = tool_pointer(self.tool) {
+            self.tool_cursor = Some((icon, hp));
+            ctx.set_cursor_icon(CursorIcon::None);
             return;
         }
         let p = pos2((hp.x - crect.min.x) / self.zoom, (hp.y - crect.min.y) / self.zoom);
@@ -2433,6 +2447,9 @@ impl PaintApp {
                     self.render_live_shape();
                     self.sync_texture(&ctx);
                     self.paint_canvas(&painter, &resp, crect);
+                    if let Some((icon, p)) = self.tool_cursor {
+                        paint_tool_pointer(&painter, icon, p);
+                    }
                     if self.tool.is_selection() && matches!(self.op, Op::Idle) {
                         resp.context_menu(|ui| self.selection_menu(ui));
                     }
@@ -2557,20 +2574,20 @@ impl PaintApp {
             painter.image(tex.id(), crect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
         }
 
-        if self.show_grid && zoom >= 4.0 {
+        if self.show_grid {
             let vis = painter.clip_rect().intersect(crect);
-            let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(128, 128, 128, 90));
-            let x0 = ((vis.min.x - crect.min.x) / zoom).floor() as i32;
-            let x1 = ((vis.max.x - crect.min.x) / zoom).ceil() as i32;
-            for x in x0..=x1 {
-                let sx = crect.min.x + x as f32 * zoom;
-                painter.line_segment([pos2(sx, vis.min.y), pos2(sx, vis.max.y)], stroke);
+            let gap = grid_step(zoom) as f32 * zoom;
+            // One physical pixel wide and centred on one, so the lines stay sharp at any display scale.
+            let ppp = self.ctx.pixels_per_point();
+            let snap = |v: f32| ((v * ppp).floor() + 0.5) / ppp;
+            let stroke = Stroke::new(1.0 / ppp, Color32::from_rgba_unmultiplied(128, 128, 128, 110));
+            let first = |lo: f32, origin: f32| ((lo - origin) / gap).floor() as i32;
+            let last = |hi: f32, origin: f32| ((hi - origin) / gap).ceil() as i32;
+            for k in first(vis.min.x, crect.min.x)..=last(vis.max.x, crect.min.x) {
+                painter.vline(snap(crect.min.x + k as f32 * gap), vis.y_range(), stroke);
             }
-            let y0 = ((vis.min.y - crect.min.y) / zoom).floor() as i32;
-            let y1 = ((vis.max.y - crect.min.y) / zoom).ceil() as i32;
-            for y in y0..=y1 {
-                let sy = crect.min.y + y as f32 * zoom;
-                painter.line_segment([pos2(vis.min.x, sy), pos2(vis.max.x, sy)], stroke);
+            for k in first(vis.min.y, crect.min.y)..=last(vis.max.y, crect.min.y) {
+                painter.hline(vis.x_range(), snap(crect.min.y + k as f32 * gap), stroke);
             }
         }
 
@@ -3056,6 +3073,42 @@ fn lasso_mask(poly: &[Pos2], w: u32, h: u32) -> Mask {
 fn text_handle_at(bounds: Rect, p: Pos2, tol: f32, zoom: f32) -> Option<usize> {
     let r = bounds.expand(3.0 / zoom);
     [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()].iter().position(|c| (p - *c).abs().max_elem() <= tol)
+}
+
+/// Tools whose mouse pointer is their own icon, as in Paint.
+fn tool_pointer(tool: Tool) -> Option<Icon> {
+    match tool {
+        Tool::Pencil => Some(Icon::Pencil),
+        Tool::Fill => Some(Icon::Fill),
+        Tool::Brush => Some(Icon::Brushes),
+        _ => None,
+    }
+}
+
+/// Draws a tool pointer so the tool's tip (where it paints) sits on `p`.
+fn paint_tool_pointer(painter: &egui::Painter, icon: Icon, p: Pos2) {
+    const SIZE: f32 = 24.0;
+    // The tip on the icon's 20×20 grid.
+    let tip = match icon {
+        Icon::Pencil => vec2(2.5, 17.5),
+        Icon::Brushes => vec2(3.0, 18.4),
+        _ => vec2(17.9, 18.6), // the drop of paint pouring from the bucket
+    };
+    let min = p - tip * (SIZE / 20.0);
+    icons::paint_halo(icon, painter, Rect::from_min_size(min, Vec2::splat(SIZE)));
+}
+
+/// Image pixels between gridlines: every pixel from 400% up, as in Paint;
+/// below that, the smallest power of two that keeps lines at least 8 points apart.
+fn grid_step(zoom: f32) -> u32 {
+    if zoom >= 4.0 {
+        return 1;
+    }
+    let mut step = 1;
+    while (step as f32) * zoom < 8.0 {
+        step *= 2;
+    }
+    step
 }
 
 fn text_handle_cursor(h: usize) -> CursorIcon {
@@ -3788,6 +3841,44 @@ mod tests {
 
     fn typed(a: &PaintApp) -> &str {
         a.text.as_ref().map_or("", |t| t.text.as_str())
+    }
+
+    #[test]
+    fn pencil_fill_and_brush_use_their_own_pointer() {
+        let mut a = app();
+        let ctx = a.ctx.clone();
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 700.0));
+        let mut frame = |a: &mut PaintApp, events: Vec<Event>| {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| a.canvas(ui));
+            out.textures_delta.clear();
+            out.platform_output.cursor_icon
+        };
+        frame(&mut a, vec![]);
+        let over = a.canvas_rect.min + vec2(20.0, 20.0);
+        for (tool, icon) in [(Tool::Pencil, Icon::Pencil), (Tool::Fill, Icon::Fill), (Tool::Brush, Icon::Brushes)] {
+            a.tool = tool;
+            assert_eq!(frame(&mut a, vec![Event::PointerMoved(over)]), CursorIcon::None, "{tool:?}");
+            assert_eq!(a.tool_cursor, Some((icon, over)));
+        }
+        a.tool = Tool::Shape;
+        assert_eq!(frame(&mut a, vec![Event::PointerMoved(over)]), CursorIcon::Crosshair);
+        assert_eq!(a.tool_cursor, None);
+        // Off the canvas the normal pointer comes back.
+        a.tool = Tool::Pencil;
+        frame(&mut a, vec![Event::PointerMoved(pos2(990.0, 690.0))]);
+        assert_eq!(a.tool_cursor, None);
+    }
+
+    #[test]
+    fn gridlines_show_at_every_zoom() {
+        assert_eq!(grid_step(1.0), 8);
+        assert_eq!(grid_step(0.5), 16);
+        assert_eq!(grid_step(2.0), 4);
+        assert_eq!(grid_step(3.0), 4);
+        assert_eq!(grid_step(4.0), 1);
+        assert_eq!(grid_step(8.0), 1);
+        assert_eq!(grid_step(0.125), 64);
     }
 
     #[test]

@@ -114,6 +114,8 @@ struct Pen<'a> {
     origin: Pos2,
     unit: f32,
     disabled: bool,
+    /// Draw every part in this one color (keeping its alpha): an outline halo.
+    solid: Option<Color32>,
     /// Physical pixels per point, for snapping to the pixel grid.
     ppp: f32,
 }
@@ -125,6 +127,9 @@ impl Pen<'_> {
 
     /// Disabled icons are drawn faded and grey, like Windows does.
     fn c(&self, col: Color32) -> Color32 {
+        if let Some(s) = self.solid {
+            return Color32::from_rgba_unmultiplied(s.r(), s.g(), s.b(), col.a());
+        }
         if !self.disabled {
             return col;
         }
@@ -335,10 +340,24 @@ impl Pen<'_> {
 }
 
 pub fn paint(icon: Icon, painter: &Painter, rect: Rect, enabled: bool) {
+    paint_with(icon, painter, rect, !enabled, None);
+}
+
+/// The icon with a white outline around it, so it stays visible on any color
+/// (used for the tool-shaped mouse pointers).
+pub fn paint_halo(icon: Icon, painter: &Painter, rect: Rect) {
+    let d = 1.0;
+    for off in [vec2(-d, 0.0), vec2(d, 0.0), vec2(0.0, -d), vec2(0.0, d), vec2(-d, -d), vec2(d, -d), vec2(-d, d), vec2(d, d)] {
+        paint_with(icon, painter, rect.translate(off), false, Some(Color32::WHITE));
+    }
+    paint_with(icon, painter, rect, false, None);
+}
+
+fn paint_with(icon: Icon, painter: &Painter, rect: Rect, disabled: bool, solid: Option<Color32>) {
     // Start on a whole physical pixel, so edges don't straddle two pixels and blur.
     let ppp = painter.ctx().pixels_per_point();
     let rect = Rect::from_min_size(((rect.min.to_vec2() * ppp).round() / ppp).to_pos2(), rect.size());
-    let pen = Pen { painter, origin: rect.min, unit: rect.width() / 20.0, disabled: !enabled, ppp };
+    let pen = Pen { painter, origin: rect.min, unit: rect.width() / 20.0, disabled, solid, ppp };
     match icon {
         Icon::Paste => {
             pen.rect((3.5, 2.5), (16.5, 19.0), BROWN, Some(BROWN_DARK));
@@ -458,7 +477,7 @@ pub fn paint(icon: Icon, painter: &Painter, rect: Rect, enabled: bool) {
         Icon::EditColors => {
             let px = (rect.width() * ppp).round().max(1.0) as u32;
             let tex = cached_texture(painter.ctx(), "color-wheel", px, render_color_wheel);
-            let tint = if enabled { Color32::WHITE } else { Color32::from_white_alpha(90) };
+            let tint = if !disabled { Color32::WHITE } else { Color32::from_white_alpha(90) };
             let r = Rect::from_min_size(rect.min, Vec2::splat(px as f32 / ppp));
             painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), tint);
         }
@@ -604,7 +623,7 @@ pub fn paint(icon: Icon, painter: &Painter, rect: Rect, enabled: bool) {
         Icon::Shape(kind) => {
             let px = (rect.width() * ppp).round().max(1.0) as u32;
             let tex = shape_texture(painter.ctx(), kind, px);
-            let tint = if enabled { Color32::WHITE } else { Color32::from_white_alpha(90) };
+            let tint = if !disabled { Color32::WHITE } else { Color32::from_white_alpha(90) };
             let r = Rect::from_min_size(rect.min, Vec2::splat(px as f32 / ppp));
             painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), tint);
         }

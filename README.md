@@ -57,6 +57,7 @@ It recreates Paint's look and the way it behaves: the ribbon with its File menu 
 
 ### Drawing tools
 - **Pencil**: hard-edged lines, 1–20 px.
+- The mouse pointer turns into the tool itself for the Pencil, Fill and Brushes, with the tip exactly where the paint goes.
 - **Brushes**: nine types: Brush, Calligraphy 1 and 2, Airbrush (keeps spraying while you hold still), Oil, Crayon, Marker (translucent), Natural pencil and Watercolor.
 - **Fill with color**: flood fill with adjustable tolerance. It also reaches into the smoothed edges of outlines, so no pale ring is left between the fill and the outline.
 - **Eraser**: paints Color 2.
@@ -93,7 +94,7 @@ It recreates Paint's look and the way it behaves: the ribbon with its File menu 
 
 ### Viewing
 - Zoom with Ctrl + scroll, the status-bar slider, presets or the Magnifier. Zoom stays centered on the pointer.
-- **Rulers** with a marker following the cursor, **gridlines** at 400% and above, **full screen**, and a **thumbnail** window.
+- **Rulers** with a marker following the cursor, **gridlines** at any zoom (one per pixel from 400% up), **full screen**, and a **thumbnail** window.
 - Resize the canvas by dragging its handles, or type an exact size in **Image Properties**. New space is filled with Color 2.
 - Middle-drag to pan.
 
