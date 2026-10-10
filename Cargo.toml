@@ -1,0 +1,24 @@
+[package]
+name = "paint"
+version = "0.1.0"
+edition = "2024"
+description = "A from-scratch Rust reimplementation of classic Windows Paint for macOS"
+license = "MIT"
+repository = "https://github.com/stephenkingston/paint"
+readme = "README.md"
+keywords = ["paint", "drawing", "egui", "macos", "image-editor"]
+categories = ["graphics", "multimedia::images"]
+
+[dependencies]
+ab_glyph = "0.2"
+arboard = "3.6"
+eframe = "0.36"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff", "webp", "ico"] }
+rfd = "0.17"
+
+[profile.dev]
+opt-level = 1
+
+# Pixel loops are painfully slow unoptimized, even in debug builds.
+[profile.dev.package."*"]
+opt-level = 3

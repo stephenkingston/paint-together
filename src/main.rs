@@ -1,0 +1,49 @@
+//! Paint: a from-scratch Rust reimplementation of the Windows Paint app.
+
+mod app;
+mod brush;
+mod history;
+mod icons;
+mod live_shape;
+mod logo;
+mod raster;
+mod ribbon;
+mod shapes;
+#[cfg(test)]
+mod tests;
+mod text;
+mod text_edit;
+mod theme;
+
+use eframe::egui;
+
+fn main() -> eframe::Result {
+    let mut args = std::env::args_os().skip(1);
+    let first = args.next();
+    // Used by bundle-macos.sh to build the .icns.
+    if first.as_deref() == Some(std::ffi::OsStr::new("--export-icon")) {
+        let out = args.next().map(std::path::PathBuf::from).unwrap_or_else(|| "AppIcon.png".into());
+        if let Err(e) = logo::render(1024).save(&out) {
+            eprintln!("couldn't write {}: {e}", out.display());
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let initial = first.map(std::path::PathBuf::from);
+    let icon = logo::render(256);
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Untitled - Paint")
+            .with_app_id("paint")
+            .with_inner_size([1460.0, 900.0])
+            .with_min_inner_size([760.0, 480.0])
+            .with_drag_and_drop(true)
+            // Draw our own title bar under the traffic lights, like modern Mac apps.
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false)
+            .with_icon(egui::IconData { width: icon.width(), height: icon.height(), rgba: icon.into_raw() }),
+        ..Default::default()
+    };
+    eframe::run_native("Paint", options, Box::new(move |cc| Ok(Box::new(app::PaintApp::new(cc, initial)))))
+}

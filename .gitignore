@@ -1,0 +1,4 @@
+/target
+# Local reference files, not part of the project
+/Microsoft.Paint_*
+.DS_Store
