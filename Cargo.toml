@@ -1,13 +1,21 @@
 [package]
-name = "paint"
-version = "0.1.0"
+name = "paint-together"
+version = "0.2.0"
 edition = "2024"
-description = "A from-scratch Rust reimplementation of classic Windows Paint"
+rust-version = "1.85"
+description = "Classic Windows Paint, rebuilt in Rust, where kids on the same Wi-Fi draw on one picture together in real time"
 license = "MIT"
-repository = "https://github.com/stephenkingston/paint"
+repository = "https://github.com/stephenkingston/paint-together"
 readme = "README.md"
-keywords = ["paint", "drawing", "egui", "linux", "image-editor"]
+keywords = ["paint", "drawing", "collaborative", "kids", "egui"]
 categories = ["graphics", "multimedia::images"]
+# What goes to crates.io: the code, not the screenshots or release tooling.
+include = ["/src", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
+
+# The installed command is `paint`.
+[[bin]]
+name = "paint"
+path = "src/main.rs"
 
 [dependencies]
 ab_glyph = "0.2"

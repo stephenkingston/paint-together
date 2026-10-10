@@ -1,12 +1,14 @@
-# Paint, in Rust
+# Paint Together
 
-A from-scratch reimplementation of **classic Microsoft Paint** (the Windows 7 / Windows 10 ribbon edition) for Linux, written in Rust with [egui](https://github.com/emilk/egui).
+**Classic Microsoft Paint, rebuilt in Rust, where kids on the same Wi-Fi draw on one picture together, live.** There's no server, no accounts and no internet: one kid starts a drawing, friends join it in a tap, and everyone sees each other's strokes and pointers as they draw.
 
-It recreates Paint's look and the way it behaves: the ribbon with its File menu and tabs, the tools and brushes, the shape gallery with shapes you can move and resize after drawing, typing straight onto the canvas, the Windows color dialog, rulers, and more. All of it runs natively on Linux, on both Wayland and X11.
+![Three kids drawing one picture together: Happy Otter draws the house, Brave Tiger the tree and birds, and Sunny Koala the sky, sun and grass, each seeing the others' pointers and strokes live](docs/demo.gif)
 
-Kids on the same Wi-Fi can also **draw together on one picture, in real time**, with no server and no internet: one kid starts a drawing, and friends join it in a tap.
+Underneath is a from-scratch reimplementation of **classic Paint** (the Windows 7 / Windows 10 ribbon edition) for Linux, written in Rust with [egui](https://github.com/emilk/egui). It has the ribbon with its File menu and tabs, the tools and brushes, shapes you can move and resize after drawing, typing straight onto the canvas, the Windows color dialog, rulers and more. It runs natively on Wayland and X11.
 
-![Paint in action: brush strokes, a live shape being resized, a fill, typing on the canvas and moving a selection](docs/demo.gif)
+```sh
+cargo install paint-together     # then run: paint
+```
 
 > **Not affiliated with Microsoft.** "Microsoft", "Windows" and "Paint" are trademarks of Microsoft Corporation. This project contains no Microsoft code, icons or other assets: every icon is drawn in code, and the app icon is original.
 
@@ -14,10 +16,10 @@ Kids on the same Wi-Fi can also **draw together on one picture, in real time**, 
 
 ## Contents
 
-- [Screenshots](#screenshots)
-- [Features](#features)
 - [Drawing together](#drawing-together)
 - [Install](#install)
+- [Screenshots](#screenshots)
+- [Features](#features)
 - [Build from source](#build-from-source)
 - [Using Paint](#using-paint)
 - [Keyboard shortcuts](#keyboard-shortcuts)
@@ -29,9 +31,66 @@ Kids on the same Wi-Fi can also **draw together on one picture, in real time**, 
 
 ---
 
+## Drawing together
+
+![A kid's Paint on the Together tab: the Friends list shows Happy Otter, Brave Tiger and Sunny Koala, and Brave Tiger's brush and name tag move across the picture as a purple flower is drawn](docs/screenshots/together.png)
+
+Everything happens on the **Together** tab.
+
+1. One kid presses **Start drawing**. Their picture becomes the shared one.
+2. Friends on the same Wi-Fi press **Join a drawing** and tap it in the list, or click *Join Maya's drawing* in the status bar. If it doesn't show up, type the address shown on the host's Together tab, such as `192.168.1.20`.
+3. Everyone draws at once.
+
+<img src="docs/screenshots/together-join.png" alt="The Join a drawing dialog, listing two drawings nearby with how many kids are in each, and a field to type an address" width="390">
+
+What you get:
+- **See friends draw as they draw.** Strokes, shapes being dragged out, text being typed and selections being moved all show up live on everyone's screen. You also see each friend's pointer: their tool (the eraser shows as its square), with their name in their colour.
+- **Every screen ends up identical.** The host's Paint puts every finished edit in one order and passes it on, and every app applies edits in that order. Edits travel as the pixels that changed, never as commands, so different computers, fonts or maths libraries can't make pictures drift apart.
+- **Undo takes back only your own work.** Anything a friend drew over it since stays.
+- **Anyone can change the whole picture** (New, Open, Rotate, Crop, Resize…). New and Open ask first, because they replace the picture on everyone's screen.
+- **If the host leaves, the drawing carries on.** The next kid's Paint takes over as host, and everyone reconnects to it automatically, keeping their undo history and any edits still on their way.
+- **Who's here.** The Friends list shows up to nine names, and a button opens the full list for a big room. The status bar says how many friends are drawing, and a short notice says who joined or left. When a crowd arrives, it's one notice, such as "12 friends joined".
+- **Fun names** ("Mighty Hedgehog") and colours, which you can change on the Together tab.
+
+From the command line, `paint --join 192.168.1.20` opens Paint and joins that drawing straight away.
+
+**Network:** drawing together uses TCP port **47100** (or another free port) for the drawing, and mDNS (UDP port **5353**) to find drawings nearby. Both stay on the local network. If a firewall blocks them, friends can't find or join the drawing; with `ufw`, for example, run `sudo ufw allow 47100/tcp` and `sudo ufw allow 5353/udp`. There is no join code: anyone on the same network can join a drawing they can see.
+
+---
+
+## Install
+
+**With Cargo** (any 64-bit Linux, on x86_64 or ARM64):
+
+```sh
+cargo install paint-together
+paint
+```
+
+This builds Paint from [crates.io](https://crates.io/crates/paint-together) and installs the `paint` command into `~/.cargo/bin`. You'll need [Rust](https://rustup.rs) 1.85 or later; no GTK, Qt or other `-dev` packages are needed.
+
+**Prebuilt (x86_64):** each [GitHub release](https://github.com/stephenkingston/paint-together/releases) has a `paint-<version>-linux-x86_64.tar.gz`. Drawing together arrived in version 0.2.0. Download it, then:
+
+```sh
+tar xzf paint-<version>-linux-x86_64.tar.gz
+cd paint-<version>-linux-x86_64
+./paint                 # run it from here, or
+./install.sh            # install it for your user
+```
+
+`install.sh` doesn't need root. It copies the binary to `~/.local/bin/paint`, and adds the icon and a *Paint* entry to your app launcher. To uninstall, delete `~/.local/bin/paint`, `~/.local/share/applications/paint.desktop` and `~/.local/share/icons/hicolor/256x256/apps/paint.png`. To check a download: `sha256sum -c paint-<version>-linux-x86_64.tar.gz.sha256`.
+
+### Requirements
+- **Linux with glibc 2.35 or newer** for the prebuilt binary: Ubuntu 22.04, Debian 12, Fedora 36, Arch, or later.
+- **Wayland or X11**, with working **Vulkan or OpenGL** drivers.
+- **fontconfig**, which the Text tool uses to find fonts.
+- An **XDG desktop portal** (`xdg-desktop-portal` plus a backend such as `-gtk`, `-kde`, `-gnome` or `-hyprland`) for the Open and Save dialogs. Desktop environments include one.
+
+---
+
 ## Screenshots
 
-**The main window**: Quick Access Toolbar, the File / Home / View tabs, the Home ribbon, the canvas and the status bar.
+**The main window**: Quick Access Toolbar, the File / Home / View / Together tabs, the Home ribbon, the canvas and the status bar.
 
 ![Main window](docs/screenshots/main-window.png)
 
@@ -55,7 +114,7 @@ Kids on the same Wi-Fi can also **draw together on one picture, in real time**, 
 ### The ribbon, as in Paint
 - **Quick Access Toolbar** above the tabs: Save, Undo, Redo.
 - **File menu** with New, Open, Save, *Save as* (PNG, JPEG, BMP, GIF, or *Other formats*), Properties, About and Exit, plus *Recent pictures*, which are kept between launches.
-- **Home**, **View** and a contextual **Text** tab. You can collapse the ribbon to just the tabs.
+- **Home**, **View**, **Together** and a contextual **Text** tab. You can collapse the ribbon to just the tabs.
 - Large and small buttons, split buttons (Paste, Select, Brushes), dropdown galleries and grouped captions, all in the Windows 10 "Scenic Ribbon" style. The tabs and highlights have softly rounded corners.
 
 ### Drawing tools
@@ -113,60 +172,14 @@ Kids on the same Wi-Fi can also **draw together on one picture, in real time**, 
 
 ---
 
-## Drawing together
-
-Everything happens on the **Together** tab.
-
-1. One kid presses **Start drawing**. Their picture becomes the shared one.
-2. Friends on the same Wi-Fi press **Join a drawing** and tap it in the list (or click *Join Maya's drawing* in the status bar). If it doesn't show up, type the address shown on the host's Together tab, such as `192.168.1.20`.
-3. Everyone draws at once.
-
-What you get:
-- **See friends draw as they draw.** Strokes, shapes being dragged out, text being typed and selections being moved all show up live on everyone's screen. You also see each friend's pointer (their tool, in their colour, with their name).
-- **Every screen ends up identical.** The host's Paint puts every finished edit in one order and passes it on, and every app applies edits in that order. Edits travel as the pixels that changed, never as commands, so different computers, fonts or maths libraries can't make pictures drift apart.
-- **Undo takes back only your own work.** Anything a friend drew over it since stays.
-- **Anyone can change the whole picture** (New, Open, Rotate, Crop, Resize…). New and Open ask first, because they replace the picture on everyone's screen.
-- **If the host leaves, the drawing carries on.** The next kid's Paint takes over as host, and everyone reconnects to it automatically. Nobody's unfinished edits or undo history are lost.
-- **Fun names** ("Mighty Hedgehog") and colours, which you can change on the Together tab.
-- A small notice pops up when friends join or leave.
-
-From the command line, `paint --join 192.168.1.20` opens Paint and joins that drawing straight away.
-
-**Network:** drawing together uses TCP port **47100** (or another free port) for the drawing, and mDNS (UDP port **5353**) to find drawings nearby. Both stay on the local network. If a firewall blocks them, friends can't find or join the drawing; with `ufw`, for example, run `sudo ufw allow 47100/tcp` and `sudo ufw allow 5353/udp`. There is no join code: anyone on the same network can join a drawing they can see.
-
----
-
-## Install
-
-Download `paint-v0.1.0-linux-x86_64.tar.gz` from the [latest release](https://github.com/stephenkingston/paint/releases/latest), then:
-
-```sh
-tar xzf paint-v0.1.0-linux-x86_64.tar.gz
-cd paint-v0.1.0-linux-x86_64
-./paint                 # run it from here, or
-./install.sh            # install it for your user
-```
-
-`install.sh` doesn't need root. It copies the binary to `~/.local/bin/paint`, and adds the icon and a *Paint* entry to your app launcher. To uninstall, delete `~/.local/bin/paint`, `~/.local/share/applications/paint.desktop` and `~/.local/share/icons/hicolor/256x256/apps/paint.png`.
-
-### Requirements
-- **x86_64 Linux with glibc 2.35 or newer**: Ubuntu 22.04, Debian 12, Fedora 36, Arch, or later.
-- **Wayland or X11**, with working **Vulkan or OpenGL** drivers.
-- **fontconfig**, which the Text tool uses to find fonts.
-- An **XDG desktop portal** (`xdg-desktop-portal` plus a backend such as `-gtk`, `-kde`, `-gnome` or `-hyprland`) for the Open and Save dialogs. Desktop environments include one.
-
-To check the download: `sha256sum -c paint-v0.1.0-linux-x86_64.tar.gz.sha256`.
-
----
-
 ## Build from source
 
 You'll need **Rust 1.85** or later (the project uses the 2024 edition); install it with [rustup](https://rustup.rs). No GTK, Qt or other `-dev` packages are needed.
 
 ```sh
-git clone https://github.com/stephenkingston/paint.git
-cd paint
-cargo run --release
+git clone https://github.com/stephenkingston/paint-together.git
+cd paint-together
+cargo run --release              # or: cargo install --path .
 ```
 
 To open a picture straight away:
@@ -278,13 +291,13 @@ Paint is a single egui application. Some details worth knowing:
 cargo test
 ```
 
-The suite of 54 tests covers:
+The suite of 57 tests covers:
 - **Pixel engine:** polygon coverage, anti-aliased capsules, flood fill boundaries, tolerance, and fills that reach anti-aliased edges without leaking.
 - **Undo history.**
 - **Shapes and brushes:** the geometry of every shape, and every brush.
 - **Tools, driven as the mouse drives them:** strokes with either mouse button, the eraser, shape outline and fill, live shapes (moving, resizing, restyling, deleting), selections (moving, free-form delete, transparent selection, rotating a selection), and pasting an image larger than the canvas.
 - **Text:** rendering, and on-canvas typing using real keyboard events (caret movement, word selection, undo, input-method text, paste, click-to-place-caret).
-- **Zoom** stays centered on the pointer. **Gridlines** are spaced for every zoom level, and Pencil, Fill and Brushes use their own pointer.
+- **Zoom** stays centered on the pointer. **Gridlines** are spaced for every zoom level. Pencil, Fill, Brushes and Color picker use their own pointer, and the Eraser shows only its square.
 - **Drawing together:**
   - **Simulated rooms.** Several Paints share one hub, and the tests decide exactly when every message arrives. Directed tests cover:
     - a friend's stroke arriving while I'm mid-stroke;
@@ -292,9 +305,11 @@ The suite of 54 tests covers:
     - drawing under my text box and under a selection I'm moving;
     - a friend rotating the picture mid-stroke;
     - undo leaving friends' pixels alone;
-    - previews and pointers.
+    - previews, pointers and friends' tools;
+    - join and leave notices (a crowd arriving is one notice);
+    - friends' drawings in progress merged into the picture on screen.
   - **Random sessions.** Randomized sessions of strokes, fills, shapes, text, moved selections, undo, redo and whole-picture changes, with messages arriving in random orders. Every screen must end up identical, byte for byte, with no friend's unfinished drawing left behind.
-  - **Real sockets.** Message framing and size limits, a host and a friend talking over real sockets, and a host leaving while the next kid takes over.
+  - **Real sockets.** Message framing and size limits, a host and a friend talking over real sockets, a quiet friend staying connected while another chats, and a host leaving while the next kid takes over.
 
 One more test is run by hand across two computers: start a drawing on one, then on the other run `PAINT_JOIN=<address> cargo test joins_a_real_room -- --ignored --nocapture`.
 
@@ -317,4 +332,4 @@ One more test is run by hand across two computers: start a drawing on one, then 
 
 Released under the [MIT License](LICENSE). © 2026 Stephen Kingston.
 
-Built with [egui/eframe](https://github.com/emilk/egui), [image](https://github.com/image-rs/image), [ab_glyph](https://github.com/alexheretic/ab-glyph), [rfd](https://github.com/PolyMeilleur/rfd) and [arboard](https://github.com/1Password/arboard).
+Built with [egui/eframe](https://github.com/emilk/egui), [image](https://github.com/image-rs/image), [ab_glyph](https://github.com/alexheretic/ab-glyph), [rfd](https://github.com/PolyMeilleur/rfd), [arboard](https://github.com/1Password/arboard), [mdns-sd](https://github.com/keepsimple1/mdns-sd), [bincode](https://github.com/bincode-org/bincode) and [flate2](https://github.com/rust-lang/flate2-rs).

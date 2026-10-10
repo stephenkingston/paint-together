@@ -1,4 +1,6 @@
-A from-scratch Rust reimplementation of classic Microsoft Paint (the Windows 7/10 ribbon edition). See the [README](https://github.com/stephenkingston/paint#readme) for the full feature tour.
+Classic Microsoft Paint (the Windows 7/10 ribbon edition), rebuilt in Rust, where kids on the same Wi-Fi draw on one picture together in real time: start a drawing on the **Together** tab, and friends join it in a tap. See the [README](https://github.com/stephenkingston/paint-together#readme) for the full tour.
+
+Also on crates.io: `cargo install paint-together` installs the `paint` command.
 
 ### Linux (x86_64)
 

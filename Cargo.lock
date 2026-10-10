@@ -2327,8 +2327,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "paint"
-version = "0.1.0"
+name = "paint-together"
+version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "arboard",
