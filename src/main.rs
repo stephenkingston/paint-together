@@ -20,10 +20,11 @@ use eframe::egui;
 fn main() -> eframe::Result {
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
-    // Used by bundle-macos.sh to build the .icns.
+    // `--export-icon PATH [SIZE]`: used by the packaging scripts.
     if first.as_deref() == Some(std::ffi::OsStr::new("--export-icon")) {
         let out = args.next().map(std::path::PathBuf::from).unwrap_or_else(|| "AppIcon.png".into());
-        if let Err(e) = logo::render(1024).save(&out) {
+        let size = args.next().and_then(|s| s.to_str()?.parse().ok()).unwrap_or(1024);
+        if let Err(e) = logo::render(size).save(&out) {
             eprintln!("couldn't write {}: {e}", out.display());
             std::process::exit(1);
         }

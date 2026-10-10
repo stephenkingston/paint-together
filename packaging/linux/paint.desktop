@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Paint
+GenericName=Image Editor
+Comment=Classic Windows-style Paint, rewritten in Rust
+Exec=paint %f
+Icon=paint
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+MimeType=image/png;image/jpeg;image/bmp;image/gif;image/tiff;image/webp;
+StartupWMClass=paint

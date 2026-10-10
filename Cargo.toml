@@ -2,11 +2,11 @@
 name = "paint"
 version = "0.1.0"
 edition = "2024"
-description = "A from-scratch Rust reimplementation of classic Windows Paint for macOS"
+description = "A from-scratch Rust reimplementation of classic Windows Paint"
 license = "MIT"
 repository = "https://github.com/stephenkingston/paint"
 readme = "README.md"
-keywords = ["paint", "drawing", "egui", "macos", "image-editor"]
+keywords = ["paint", "drawing", "egui", "linux", "image-editor"]
 categories = ["graphics", "multimedia::images"]
 
 [dependencies]

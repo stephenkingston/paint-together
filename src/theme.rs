@@ -112,14 +112,28 @@ pub fn install(ctx: &Context) {
 
 fn install_fonts(ctx: &Context) {
     let mut fonts = FontDefinitions::default();
-    let faces = [
-        ("system", "/System/Library/Fonts/SFNS.ttf", None),
-        ("serif", "/System/Library/Fonts/Supplemental/Times New Roman.ttf", Some("serif")),
-        ("serif-bold", "/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf", Some("serif-bold")),
-    ];
-    for (name, path, family) in faces {
-        let Ok(bytes) = std::fs::read(path) else { continue };
-        fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_owned(bytes)));
+    // (name, file and face index, named family it defines; None = the UI font)
+    let faces: Vec<(&str, Option<(std::path::PathBuf, u32)>, Option<&str>)> = if cfg!(target_os = "macos") {
+        let at = |p: &str| Some((std::path::PathBuf::from(p), 0));
+        vec![
+            ("system", at("/System/Library/Fonts/SFNS.ttf"), None),
+            ("serif", at("/System/Library/Fonts/Supplemental/Times New Roman.ttf"), Some("serif")),
+            ("serif-bold", at("/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf"), Some("serif-bold")),
+        ]
+    } else {
+        // Whatever the desktop's fontconfig prefers.
+        vec![
+            ("system", crate::text::fc_match("sans-serif"), None),
+            ("serif", crate::text::fc_match("serif"), Some("serif")),
+            ("serif-bold", crate::text::fc_match("serif:bold"), Some("serif-bold")),
+        ]
+    };
+    for (name, face, family) in faces {
+        let Some((path, index)) = face else { continue };
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let mut data = FontData::from_owned(bytes);
+        data.index = index;
+        fonts.font_data.insert(name.to_owned(), Arc::new(data));
         match family {
             None => fonts.families.entry(FontFamily::Proportional).or_default().insert(0, name.to_owned()),
             Some(f) => {

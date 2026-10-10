@@ -27,12 +27,19 @@ impl TextStyle {
     }
 }
 
+/// One face inside a font file (collections hold several).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Face {
+    path: PathBuf,
+    index: u32,
+}
+
 pub struct FontFamily {
     pub name: String,
-    regular: Option<PathBuf>,
-    bold: Option<PathBuf>,
-    italic: Option<PathBuf>,
-    bold_italic: Option<PathBuf>,
+    regular: Option<Face>,
+    bold: Option<Face>,
+    italic: Option<Face>,
+    bold_italic: Option<Face>,
 }
 
 #[derive(Clone)]
@@ -45,57 +52,123 @@ pub struct LoadedFont {
 
 pub struct FontLibrary {
     pub families: Vec<FontFamily>,
-    cache: HashMap<PathBuf, Option<Rc<FontVec>>>,
+    cache: HashMap<Face, Option<Rc<FontVec>>>,
+}
+
+fn is_font_file(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "ttf" | "otf" | "ttc")
+}
+
+fn add_face(by_name: &mut HashMap<String, FontFamily>, name: &str, bold: bool, italic: bool, face: Face) {
+    let fam = by_name.entry(name.to_string()).or_insert_with(|| FontFamily {
+        name: name.to_string(),
+        regular: None,
+        bold: None,
+        italic: None,
+        bold_italic: None,
+    });
+    let slot = match (bold, italic) {
+        (false, false) => &mut fam.regular,
+        (true, false) => &mut fam.bold,
+        (false, true) => &mut fam.italic,
+        (true, true) => &mut fam.bold_italic,
+    };
+    slot.get_or_insert(face);
+}
+
+/// Font folders, read by file name (macOS names files "Family Bold Italic.ttf").
+fn scan_dirs(dirs: &[PathBuf], recursive: bool, by_name: &mut HashMap<String, FontFamily>) {
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if recursive && path.is_dir() {
+                scan_dirs(&[path], true, by_name);
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            if !is_font_file(&path) || stem.starts_with('.') {
+                continue;
+            }
+            let (name, bold, italic) = split_style(stem);
+            add_face(by_name, name, bold, italic, Face { path: path.clone(), index: 0 });
+        }
+    }
+}
+
+/// Ask fontconfig (Linux and other Unixes) for every installed face with its real
+/// family and style names. Returns false if fontconfig isn't available.
+fn scan_fontconfig(by_name: &mut HashMap<String, FontFamily>) -> bool {
+    let Ok(out) = std::process::Command::new("fc-list").args(["--format", "%{file}\t%{index}\t%{family[0]}\t%{style[0]}\n"]).output() else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    // Only the four standard styles; other weights (Light, Medium, Black...) are
+    // used only for families that have no regular face at all.
+    let mut fallback: Vec<(String, Face)> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let [file, index, family, style] = f[..] else { continue };
+        let path = PathBuf::from(file);
+        if !is_font_file(&path) || family.is_empty() {
+            continue;
+        }
+        let face = Face { path, index: index.parse().unwrap_or(0) };
+        let style = style.to_ascii_lowercase();
+        match style.as_str() {
+            "regular" | "book" | "normal" | "roman" => add_face(by_name, family, false, false, face),
+            "bold" => add_face(by_name, family, true, false, face),
+            "italic" | "oblique" => add_face(by_name, family, false, true, face),
+            "bold italic" | "bold oblique" => add_face(by_name, family, true, true, face),
+            _ => fallback.push((family.to_string(), face)),
+        }
+    }
+    for (family, face) in fallback {
+        if by_name.get(&family).is_none_or(|f| f.regular.is_none()) {
+            add_face(by_name, &family, false, false, face);
+        }
+    }
+    !by_name.is_empty()
+}
+
+/// The file (and face index) fontconfig picks for a pattern such as "sans-serif"
+/// or "serif:bold".
+pub fn fc_match(pattern: &str) -> Option<(PathBuf, u32)> {
+    let out = std::process::Command::new("fc-match").args(["--format", "%{file}\t%{index}", pattern]).output().ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let (file, index) = text.split_once('\t')?;
+    let path = PathBuf::from(file);
+    is_font_file(&path).then(|| (path, index.trim().parse().unwrap_or(0)))
 }
 
 impl FontLibrary {
     pub fn scan() -> Self {
-        let mut dirs = vec![
-            PathBuf::from("/System/Library/Fonts/Supplemental"),
-            PathBuf::from("/System/Library/Fonts"),
-            PathBuf::from("/Library/Fonts"),
-        ];
-        if let Some(home) = std::env::var_os("HOME") {
-            dirs.push(Path::new(&home).join("Library/Fonts"));
-        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut by_name: HashMap<String, FontFamily> = HashMap::new();
-        for dir in dirs {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-                if !matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
-                    continue;
-                }
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-                if stem.starts_with('.') {
-                    continue;
-                }
-                let (name, bold, italic) = split_style(stem);
-                let fam = by_name.entry(name.to_string()).or_insert_with(|| FontFamily {
-                    name: name.to_string(),
-                    regular: None,
-                    bold: None,
-                    italic: None,
-                    bold_italic: None,
-                });
-                let slot = match (bold, italic) {
-                    (false, false) => &mut fam.regular,
-                    (true, false) => &mut fam.bold,
-                    (false, true) => &mut fam.italic,
-                    (true, true) => &mut fam.bold_italic,
-                };
-                slot.get_or_insert(path);
-            }
+        if cfg!(target_os = "macos") {
+            let mut dirs = vec![
+                PathBuf::from("/System/Library/Fonts/Supplemental"),
+                PathBuf::from("/System/Library/Fonts"),
+                PathBuf::from("/Library/Fonts"),
+            ];
+            dirs.extend(home.map(|h| h.join("Library/Fonts")));
+            scan_dirs(&dirs, false, &mut by_name);
+        } else if !scan_fontconfig(&mut by_name) {
+            let mut dirs = vec![PathBuf::from("/usr/share/fonts"), PathBuf::from("/usr/local/share/fonts")];
+            dirs.extend(home.iter().flat_map(|h| [h.join(".local/share/fonts"), h.join(".fonts")]));
+            scan_dirs(&dirs, true, &mut by_name);
         }
         let mut families: Vec<FontFamily> = by_name.into_values().filter(|f| f.regular.is_some()).collect();
         families.sort_by_key(|f| f.name.to_lowercase());
         Self { families, cache: HashMap::new() }
     }
 
-    /// Calibri is Paint's default; on a Mac fall back to the closest common face.
+    /// Calibri is Paint's default; otherwise the closest common face on the system.
     pub fn default_family(&self) -> usize {
-        ["Calibri", "Arial", "Helvetica", "Verdana"]
+        ["Calibri", "Arial", "Helvetica", "Verdana", "Liberation Sans", "DejaVu Sans", "Noto Sans", "Cantarell", "Ubuntu"]
             .iter()
             .find_map(|want| self.families.iter().position(|f| f.name == *want))
             .unwrap_or(0)
@@ -109,18 +182,18 @@ impl FontLibrary {
             (false, true) => fam.italic.clone(),
             (true, true) => fam.bold_italic.clone(),
         };
-        let (path, fake_bold, fake_italic) = match exact {
-            Some(p) => (p, false, false),
+        let (face, fake_bold, fake_italic) = match exact {
+            Some(f) => (f, false, false),
             None if bold && italic && fam.bold.is_some() => (fam.bold.clone()?, false, true),
             None if bold && italic && fam.italic.is_some() => (fam.italic.clone()?, true, false),
             None => (fam.regular.clone()?, bold, italic),
         };
         let font = self
             .cache
-            .entry(path.clone())
+            .entry(face.clone())
             .or_insert_with(|| {
-                let data = std::fs::read(&path).ok()?;
-                FontVec::try_from_vec_and_index(data, 0).ok().map(Rc::new)
+                let data = std::fs::read(&face.path).ok()?;
+                FontVec::try_from_vec_and_index(data, face.index).ok().map(Rc::new)
             })
             .clone()?;
         Some(LoadedFont { font, fake_bold, fake_italic })
@@ -135,6 +208,13 @@ fn split_style(stem: &str) -> (&str, bool, bool) {
         (" Bold", true, false),
         (" Italic", false, true),
         (" Oblique", false, true),
+        // Linux-style file names, e.g. DejaVuSans-BoldOblique.ttf
+        ("-BoldItalic", true, true),
+        ("-BoldOblique", true, true),
+        ("-Bold", true, false),
+        ("-Italic", false, true),
+        ("-Oblique", false, true),
+        ("-Regular", false, false),
     ] {
         if let Some(name) = stem.strip_suffix(suffix) {
             return (name, b, i);

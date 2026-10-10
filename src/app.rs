@@ -1544,7 +1544,9 @@ impl PaintApp {
                 true
             }
             Event::Key { key, pressed: true, modifiers: m, .. } => {
-                let (shift, word, line) = (m.shift, m.alt, m.command);
+                // On a Mac ⌥ moves by word and ⌘ by line; elsewhere Ctrl moves by word.
+                let (word, line) = if cfg!(target_os = "macos") { (m.alt, m.command) } else { (m.command, false) };
+                let (shift, cmd) = (m.shift, m.command);
                 match key {
                     Key::Backspace => cur.backspace(text, layout, word, line),
                     Key::Delete => cur.delete(text, word),
@@ -1557,10 +1559,10 @@ impl PaintApp {
                     Key::ArrowDown => cur.vertical(text, layout, 1, shift),
                     Key::Home => cur.line_start(layout, shift),
                     Key::End => cur.line_end(layout, shift),
-                    Key::A if line => cur.select_all(text),
-                    Key::Z if line && shift => cur.redo(text),
-                    Key::Y if line => cur.redo(text),
-                    Key::Z if line => cur.undo(text),
+                    Key::A if cmd => cur.select_all(text),
+                    Key::Z if cmd && shift => cur.redo(text),
+                    Key::Y if cmd => cur.redo(text),
+                    Key::Z if cmd => cur.undo(text),
                     Key::Escape => tb.editing = false,
                     // Anything else (e.g. ⌘S) goes on to the app.
                     _ => return false,
@@ -1663,17 +1665,22 @@ impl PaintApp {
         let p = Palette::of(ui);
         let ctx = ui.ctx().clone();
         let bar = ui.max_rect();
-        // Registered first so the buttons on top of it win; dragging the bar moves the window.
-        let drag = ui.interact(bar, Id::new("titlebar-drag"), Sense::click_and_drag());
-        if drag.drag_started_by(PointerButton::Primary) {
-            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+        // On macOS this strip *is* the title bar (the system one is hidden): it shows the
+        // title and moves the window. Elsewhere the window keeps its own title bar and
+        // this is just the Quick Access Toolbar.
+        if cfg!(target_os = "macos") {
+            // Registered first so the buttons on top of it win.
+            let drag = ui.interact(bar, Id::new("titlebar-drag"), Sense::click_and_drag());
+            if drag.drag_started_by(PointerButton::Primary) {
+                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+            if drag.double_clicked() {
+                let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+            }
+            let title = format!("{} - Paint", self.doc_name());
+            ui.painter().text(bar.center(), Align2::CENTER_CENTER, title, FontId::proportional(12.5), p.text);
         }
-        if drag.double_clicked() {
-            let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-            ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
-        }
-        let title = format!("{} - Paint", self.doc_name());
-        ui.painter().text(bar.center(), Align2::CENTER_CENTER, title, FontId::proportional(12.5), p.text);
 
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -3795,8 +3802,8 @@ mod tests {
         assert_eq!(typed(&a), "Hello");
         type_events(&mut a, vec![key(Key::End, Modifiers::NONE), key(Key::Enter, Modifiers::NONE), Event::Text("World".into())]);
         assert_eq!(typed(&a), "Hello\nWorld");
-        // ⌥⇧← selects the last word; typing replaces it; ⌘Z brings it back.
-        let word_select = Modifiers { alt: true, shift: true, ..Default::default() };
+        // ⌥⇧← (Ctrl+Shift+← off the Mac) selects the last word; typing replaces it; ⌘Z brings it back.
+        let word_select = if cfg!(target_os = "macos") { Modifiers::ALT | Modifiers::SHIFT } else { Modifiers::COMMAND | Modifiers::SHIFT };
         type_events(&mut a, vec![key(Key::ArrowLeft, word_select)]);
         type_events(&mut a, vec![Event::Text("Paint".into())]);
         assert_eq!(typed(&a), "Hello\nPaint");
