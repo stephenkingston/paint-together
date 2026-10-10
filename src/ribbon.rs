@@ -186,6 +186,9 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, checked: bool, enabled: bool, toolti
 /// A ribbon group: content centred in the content area, caption underneath,
 /// separator line after. `content_h` is the content's height.
 pub fn group(ui: &mut Ui, caption: Option<&str>, content_h: f32, add: impl FnOnce(&mut Ui)) {
+    // At least as wide as the caption, so it never gets cut off.
+    let caption_w =
+        caption.map_or(0.0, |c| ui.painter().layout_no_wrap(c.to_owned(), FontId::proportional(LABEL), P.text_weak).size().x + 12.0);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         let row = ui.allocate_ui_with_layout(
@@ -193,6 +196,7 @@ pub fn group(ui: &mut Ui, caption: Option<&str>, content_h: f32, add: impl FnOnc
             eframe::egui::Layout::top_down(eframe::egui::Align::Min),
             |ui| {
                 ui.set_min_height(CONTENT_H);
+                ui.set_min_width(caption_w);
                 ui.add_space(((CONTENT_H - content_h) * 0.5).max(0.0));
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
@@ -367,6 +371,20 @@ pub fn status_item(ui: &mut Ui, icon: Icon, text: &str, width: f32) {
     icons::paint(icon, ui.painter(), icons::square(rect.left_center() + vec2(10.0, 0.0), 16.0), true);
     ui.painter().text(rect.left_center() + vec2(24.0, 0.0), Align2::LEFT_CENTER, text, FontId::proportional(12.0), P.text);
     ui.painter().vline(rect.max.x - 0.5, eframe::egui::Rangef::new(rect.top() + 2.0, rect.bottom() - 2.0), Stroke::new(1.0, P.status_border));
+}
+
+/// A status bar item that can be clicked, shown like a link.
+pub fn status_link(ui: &mut Ui, icon: Icon, text: &str) -> Response {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(12.0), P.accent);
+    let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 34.0, 22.0), Sense::click());
+    let resp = resp.on_hover_cursor(eframe::egui::CursorIcon::PointingHand);
+    if resp.hovered() {
+        ui.painter().rect_filled(rect.shrink2(vec2(1.0, 2.0)), HIGHLIGHT_RADIUS, P.hover);
+    }
+    icons::paint(icon, ui.painter(), icons::square(rect.left_center() + vec2(12.0, 0.0), 16.0), true);
+    ui.painter().galley(rect.left_center() + vec2(26.0, -galley.size().y / 2.0), galley, P.accent);
+    ui.painter().vline(rect.max.x - 0.5, eframe::egui::Rangef::new(rect.top() + 2.0, rect.bottom() - 2.0), Stroke::new(1.0, P.status_border));
+    resp
 }
 
 /// The Windows 10 Paint zoom slider: thin track, tick at 100%, rectangular thumb.

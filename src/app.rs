@@ -11,6 +11,11 @@ use eframe::egui::{
 use image::{DynamicImage, Rgba, RgbaImage, imageops};
 
 use crate::brush::{self, BrushKind};
+use crate::collab::discovery::Discovery;
+use crate::collab::net::{self, Link, LinkEvent};
+use crate::collab::patch::{self as collab_patch, Edit, Patch, Region};
+use crate::collab::protocol::{FromHub, Held, Kid, Presence, ToHub};
+use crate::collab::{Received, Session, names};
 use crate::history::{Change, History};
 use crate::icons::{self, FileKind, Icon};
 use crate::live_shape::{self, LiveShape};
@@ -59,6 +64,7 @@ const PALETTE: [([u8; 3], &str); 20] = [
 enum Tab {
     Home,
     View,
+    Together,
     Text,
 }
 
@@ -91,6 +97,9 @@ struct Floating {
     before: RgbaImage,
     /// Where the pixels were lifted from; empty for pasted images.
     origin: IRect,
+    /// Where they were lifted from (holding the pixels as they were then) and the
+    /// Color 2 left behind there; none for pastes.
+    hole: Option<(Patch, Rgba8)>,
     /// Pasting enlarged the canvas.
     canvas_changed: bool,
 }
@@ -223,6 +232,27 @@ enum Pending {
     New,
     Open(Option<PathBuf>),
     Quit,
+    /// Join the drawing at this address.
+    Join(String),
+}
+
+/// A short notice at the bottom of the picture.
+struct Toast {
+    text: String,
+    /// When it disappears.
+    until: f64,
+    /// For "… joined" / "… left": which, and how many friends it's about, so
+    /// a burst of arrivals becomes one notice.
+    group: Option<(&'static str, usize)>,
+}
+
+/// Moving the room to a new host after the host left.
+struct Handover {
+    /// Whom to try, in order: the old host (in case only my connection dropped),
+    /// then everyone else, earliest to join first. Whoever reaches themselves hosts.
+    candidates: Vec<Kid>,
+    /// The listener kept ready for hosting, while no attempt holds it.
+    spare: Option<std::net::TcpListener>,
 }
 
 struct ResizeDialog {
@@ -239,6 +269,38 @@ pub struct PaintApp {
     path: Option<PathBuf>,
     history: History,
     saved_state: u64,
+    /// Drawing together with friends.
+    session: Option<Session>,
+    /// `session.version` when last saved.
+    saved_version: u64,
+    /// The connection to the room (hosting or joined).
+    link: Option<Link>,
+    /// When hosting: the address friends can join at.
+    invite: Option<std::net::SocketAddr>,
+    /// My name and colour when drawing together.
+    me_name: String,
+    me_color: [u8; 3],
+    /// The Join dialog, with the address typed so far.
+    join_dialog: Option<String>,
+    /// New/Open while drawing together: asks first, since it changes everyone's picture.
+    confirm_everyone: Option<Pending>,
+    /// Where the picture on screen changed since my preview was last sent.
+    preview_dirty: IRect,
+    /// When my preview and pointer were last sent.
+    last_share: f64,
+    /// The mouse pointer over the picture, in picture pixels (for friends to see).
+    pointer: Option<Pos2>,
+    /// Finding drawings nearby (started the first time the Together tab opens).
+    discovery: Option<Discovery>,
+    /// Short notices ("Blue Fox joined"), with when each disappears.
+    toasts: Vec<Toast>,
+    /// The host left: finding (or becoming) the new one.
+    handover: Option<Handover>,
+    /// Advertise and look for drawings with mDNS (off in tests).
+    lan_discovery: bool,
+    /// For my whole-picture edits (by undo step): how many friends' edits had
+    /// arrived when I made it. It can only be undone while that's still the count.
+    replace_marks: std::collections::HashMap<u64, u64>,
 
     tool: Tool,
     prev_tool: Tool,
@@ -312,8 +374,21 @@ pub struct PaintApp {
 }
 
 impl PaintApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
-        Self::with_context(cc.egui_ctx.clone(), initial)
+    pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>, join: Option<String>) -> Self {
+        let mut app = Self::with_context(cc.egui_ctx.clone(), initial);
+        app.lan_discovery = true;
+        match load_me() {
+            Some((name, color)) => (app.me_name, app.me_color) = (name, color),
+            None => {
+                (app.me_name, app.me_color) = names::random();
+                save_me(&app.me_name, app.me_color);
+            }
+        }
+        if let Some(addr) = join {
+            app.tab = Tab::Together;
+            app.join_together(addr);
+        }
+        app
     }
 
     fn with_context(ctx: Context, initial: Option<PathBuf>) -> Self {
@@ -332,6 +407,22 @@ impl PaintApp {
             path: None,
             history: History::default(),
             saved_state: 0,
+            session: None,
+            saved_version: 0,
+            link: None,
+            invite: None,
+            me_name: String::new(),
+            me_color: names::COLORS[0],
+            join_dialog: None,
+            confirm_everyone: None,
+            preview_dirty: IRect::EMPTY,
+            last_share: f64::NEG_INFINITY,
+            pointer: None,
+            discovery: None,
+            toasts: Vec::new(),
+            handover: None,
+            lan_discovery: false,
+            replace_marks: Default::default(),
             tool: Tool::Pencil,
             prev_tool: Tool::Pencil,
             brush: BrushKind::Brush,
@@ -414,12 +505,32 @@ impl PaintApp {
 
     fn push_patch(&mut self, before: &RgbaImage, r: IRect) {
         if let Some(change) = Change::patch(before, &self.img, r) {
+            self.record(change);
+        }
+    }
+
+    /// A finished edit: one undo step, and (drawing together) sent to everyone.
+    fn record(&mut self, change: Change) {
+        let Some(s) = &mut self.session else {
             self.history.push(change);
+            return;
+        };
+        let replace = matches!(change, Change::Replace { .. });
+        if let Some(edit) = Edit::from_change(&change) {
+            s.commit(edit);
+        }
+        self.history.push(change);
+        if replace {
+            self.replace_marks.insert(self.history.state_id(), s.foreign);
         }
     }
 
     fn is_dirty(&self) -> bool {
-        self.history.state_id() != self.saved_state
+        let changed = match &self.session {
+            Some(s) => s.version != self.saved_version,
+            None => self.history.state_id() != self.saved_state,
+        };
+        changed
             || self.sel.as_ref().is_some_and(|s| s.float.is_some())
             || self.text.as_ref().is_some_and(|t| !t.text.trim().is_empty())
             || self.live_shape.is_some()
@@ -433,6 +544,18 @@ impl PaintApp {
     }
 
     fn load_image(&mut self, img: RgbaImage) {
+        if self.session.is_some() {
+            // Drawing together: the new picture replaces the shared one, for everyone.
+            self.settle();
+            self.sel = None;
+            let before = std::mem::replace(&mut self.img, img);
+            self.record(Change::Replace { before, after: self.img.clone() });
+            self.tex_full = true;
+            self.zoom = 1.0;
+            self.fit_pending = true;
+            self.pending_scroll = Some(Vec2::ZERO);
+            return;
+        }
         self.op = Op::Idle;
         self.sel = None;
         self.text = None;
@@ -447,6 +570,10 @@ impl PaintApp {
     }
 
     fn request(&mut self, action: Pending) {
+        if self.session.is_some() && matches!(action, Pending::New | Pending::Open(_)) {
+            self.confirm_everyone = Some(action);
+            return;
+        }
         if self.is_dirty() {
             self.confirm = Some(action);
         } else {
@@ -463,6 +590,7 @@ impl PaintApp {
             }
             Pending::Open(Some(path)) => self.open_path(path),
             Pending::Open(None) => self.open_dialog(),
+            Pending::Join(addr) => self.join_together(addr),
             Pending::Quit => {
                 self.allow_close = true;
                 self.ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -531,6 +659,7 @@ impl PaintApp {
                 self.add_recent(&path);
                 self.path = Some(path);
                 self.saved_state = self.history.state_id();
+                self.saved_version = self.session.as_ref().map_or(0, |s| s.version);
                 true
             }
             Err(e) => {
@@ -592,6 +721,9 @@ impl PaintApp {
     }
 
     fn undo(&mut self) {
+        if self.session.is_some() {
+            return self.step_mine(true);
+        }
         self.commit_all();
         if self.history.undo(&mut self.img) {
             self.tex_full = true;
@@ -599,9 +731,619 @@ impl PaintApp {
     }
 
     fn redo(&mut self) {
+        if self.session.is_some() {
+            return self.step_mine(false);
+        }
         self.commit_all();
         if self.history.redo(&mut self.img) {
             self.tex_full = true;
+        }
+    }
+
+    /// Undo or redo one of my own edits without touching what friends drew since:
+    /// a pixel changes back only while it still shows my edit.
+    fn step_mine(&mut self, back: bool) {
+        self.settle();
+        let Some(s) = &mut self.session else { return };
+        let id = if back { self.history.state_id() } else { self.history.redo_id() };
+        let (img, marks) = (&mut self.img, &mut self.replace_marks);
+        let mut too_late = false;
+        let mut whole = false;
+        let mut region = IRect::EMPTY;
+        let stepped = self.history.step_with(back, |change| {
+            if matches!(change, Change::Replace { .. }) {
+                if marks.get(&id) != Some(&s.foreign) {
+                    too_late = true;
+                    return false;
+                }
+                whole = true;
+            }
+            if let Some(edit) = collab_patch::revert(change, &s.base, back) {
+                if let Region::Rect(r) = edit.region(img) {
+                    region = r;
+                }
+                edit.apply(img);
+                s.commit(edit);
+            }
+            true
+        });
+        if stepped && whole {
+            marks.insert(id, s.foreign);
+        }
+        if too_late {
+            self.error = Some("Too late to undo that: your friends have drawn on the picture since.".into());
+        }
+        if whole {
+            self.tex_full = true;
+        } else {
+            self.mark(region);
+        }
+    }
+
+    /// Finish whatever is in progress (a stroke, live shape, text, floating selection).
+    fn settle(&mut self) {
+        self.end();
+        self.commit_all();
+    }
+
+    // ---------------------------------------------------------------- drawing together
+
+    /// Handle one message from the room's hub.
+    fn net_receive(&mut self, msg: FromHub) {
+        if let FromHub::Welcome { you, host, seq, picture, kids } = msg {
+            let Some(img) = picture.to_image() else {
+                return;
+            };
+            if self.handover.take().is_some() {
+                if let Some(s) = &mut self.session {
+                    s.rejoin(you, host, seq, img, kids);
+                    self.img = s.base.clone();
+                    self.tex_full = true;
+                    let news = match s.kids.iter().find(|k| k.id == host) {
+                        _ if host == you => "You're the host now".to_owned(),
+                        Some(k) => format!("{} is the host now", k.name),
+                        None => "Drawing together again".to_owned(),
+                    };
+                    self.toast(news);
+                    self.advertise();
+                    return;
+                }
+            }
+            self.settle();
+            self.sel = None;
+            self.history.clear();
+            self.replace_marks.clear();
+            self.session = Some(Session::new(you, host, seq, img.clone(), kids));
+            self.saved_version = 0;
+            self.img = img;
+            self.tex_full = true;
+            self.fit_pending = true;
+            self.pending_scroll = Some(Vec2::ZERO);
+            return;
+        }
+        let Some(s) = &self.session else { return };
+        // Whole-picture changes (and anything arriving while my canvas is a
+        // different size, mid-resize) land after I finish what I'm doing.
+        let foreign = matches!(&msg, FromHub::Sequenced { from, .. } if *from != s.me);
+        if s.replaces_picture(&msg) || (foreign && self.img.dimensions() != s.base.dimensions()) {
+            self.settle();
+        }
+        let Some(s) = &mut self.session else { return };
+        let before = s.kids.clone();
+        match s.receive(msg) {
+            Received::Picture(region) => self.rebase(region),
+            Received::Kids => {
+                self.announce_kids(&before);
+                self.advertise();
+            }
+            Received::Nothing => {}
+        }
+    }
+
+    /// Start a drawing that friends on the network can join.
+    fn start_together(&mut self) {
+        self.settle();
+        match Link::host(self.img.clone(), self.me_name.clone(), self.me_color, self.ctx.clone()) {
+            Ok(link) => {
+                self.invite = link.hosting_at();
+                self.link = Some(link);
+                self.advertise();
+            }
+            Err(e) => self.error = Some(format!("Paint couldn't start drawing together.\n\n{e}")),
+        }
+    }
+
+    /// Join a friend's drawing (their picture replaces mine once connected).
+    fn join_together(&mut self, addr: String) {
+        self.settle();
+        match Link::join(addr, self.me_name.clone(), self.me_color, None, self.ctx.clone()) {
+            Ok(link) => {
+                self.invite = None;
+                self.link = Some(link);
+            }
+            Err(e) => self.error = Some(format!("Paint couldn't join that drawing.\n\n{e}")),
+        }
+    }
+
+    /// Stop drawing together; the picture stays, as an ordinary unsaved one.
+    fn leave_together(&mut self) {
+        self.settle();
+        self.flush_network();
+        let dirty = self.is_dirty();
+        self.link = None;
+        self.invite = None;
+        self.handover = None;
+        if let Some(d) = &mut self.discovery {
+            d.stop_advertising();
+        }
+        if self.session.take().is_some() {
+            self.history.clear();
+            self.replace_marks.clear();
+            self.saved_state = if dirty { u64::MAX } else { self.history.state_id() };
+        }
+    }
+
+    /// "Blue Fox joined" / "Blue Fox left", comparing with who was here before.
+    fn announce_kids(&mut self, before: &[Kid]) {
+        let Some(s) = &self.session else { return };
+        let joined: Vec<String> =
+            s.kids.iter().filter(|k| k.id != s.me && !before.iter().any(|b| b.id == k.id)).map(|k| k.name.clone()).collect();
+        let left: Vec<String> =
+            before.iter().filter(|b| b.id != s.me && !s.kids.iter().any(|k| k.id == b.id)).map(|k| k.name.clone()).collect();
+        self.announce("joined", &joined);
+        self.announce("left", &left);
+    }
+
+    /// "Blue Fox joined"; or, when several come (or go) close together, one
+    /// notice that keeps count: "5 friends joined".
+    fn announce(&mut self, verb: &'static str, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let now = self.ctx.input(|i| i.time);
+        let showing = self.toasts.iter_mut().find(|t| t.until > now && t.group.is_some_and(|(v, _)| v == verb));
+        match showing {
+            Some(t) => {
+                let count = t.group.map_or(0, |(_, n)| n) + names.len();
+                (t.text, t.until, t.group) = (format!("{count} friends {verb}"), now + 3.5, Some((verb, count)));
+            }
+            None => {
+                let text = match names {
+                    [one] => format!("{one} {verb}"),
+                    _ => format!("{} friends {verb}", names.len()),
+                };
+                self.push_toast(Toast { text, until: now + 3.5, group: Some((verb, names.len())) });
+            }
+        }
+    }
+
+    fn toast(&mut self, text: String) {
+        let until = self.ctx.input(|i| i.time) + 3.5;
+        self.push_toast(Toast { text, until, group: None });
+    }
+
+    /// At most four notices at once; the oldest goes first.
+    fn push_toast(&mut self, toast: Toast) {
+        self.toasts.push(toast);
+        if self.toasts.len() > 4 {
+            self.toasts.remove(0);
+        }
+    }
+
+    /// Notices at the bottom of the picture area, fading out.
+    fn paint_toasts(&mut self, ctx: &Context) {
+        let now = ctx.input(|i| i.time);
+        self.toasts.retain(|t| t.until > now);
+        if self.toasts.is_empty() {
+            return;
+        }
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("toasts")));
+        let mut bottom = self.view_rect.center_bottom() - vec2(0.0, 18.0);
+        for Toast { text, until, .. } in self.toasts.iter().rev() {
+            let fade = ((until - now) / 0.5).clamp(0.0, 1.0) as f32;
+            let galley = painter.layout_no_wrap(text.clone(), FontId::proportional(13.0), Color32::WHITE.gamma_multiply(fade));
+            let pill = Rect::from_center_size(bottom - vec2(0.0, 14.0), galley.size() + vec2(28.0, 12.0));
+            painter.rect_filled(pill, 14.0, Color32::from_rgba_unmultiplied(40, 40, 48, (215.0 * fade) as u8));
+            painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
+            bottom.y -= pill.height() + 6.0;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
+    /// When hosting, tell the network about the drawing (and how many are in it).
+    fn advertise(&mut self) {
+        let Some(port) = self.invite.map(|a| a.port()) else {
+            return;
+        };
+        let kids = self.session.as_ref().map_or(1, |s| s.kids.len().max(1));
+        if self.discovery.is_none() && self.lan_discovery {
+            self.discovery = Discovery::new();
+        }
+        if let Some(d) = &mut self.discovery {
+            d.advertise(&self.me_name, kids, port);
+        }
+    }
+
+    /// Look for drawings nearby, from now on.
+    fn discover(&mut self) {
+        if self.discovery.is_none() && self.lan_discovery {
+            self.discovery = Discovery::new();
+        }
+        if let Some(d) = &mut self.discovery {
+            d.browse();
+        }
+    }
+
+    /// Take in everything the network has delivered.
+    fn pump_network(&mut self) {
+        if let Some(d) = &mut self.discovery {
+            d.poll();
+            // Keep checking for drawings appearing while nobody touches the mouse.
+            if self.session.is_none() {
+                self.ctx.request_repaint_after(std::time::Duration::from_millis(700));
+            }
+        }
+        if let Some(s) = &mut self.session {
+            s.now = self.ctx.input(|i| i.time);
+        }
+        while let Some(event) = self.link.as_ref().and_then(|l| l.try_recv()) {
+            match event {
+                LinkEvent::Message(FromHub::Rejected(why)) if self.handover.is_none() => {
+                    self.leave_together();
+                    self.error = Some(why);
+                }
+                LinkEvent::Message(FromHub::Rejected(_)) => self.lost_host(),
+                LinkEvent::Message(msg) => self.net_receive(msg),
+                LinkEvent::Closed(why) if self.session.is_none() => {
+                    // Couldn't join in the first place.
+                    self.leave_together();
+                    if !why.is_empty() {
+                        self.error = Some(why);
+                    }
+                }
+                LinkEvent::Closed(_) => self.lost_host(),
+            }
+        }
+        self.step_handover();
+    }
+
+    /// The connection to the room dropped (or a takeover attempt failed).
+    fn lost_host(&mut self) {
+        let spare = self.link.take().and_then(|mut l| l.take_spare());
+        match &mut self.handover {
+            Some(h) => {
+                h.candidates.remove(0);
+                h.spare = spare.or(h.spare.take());
+            }
+            None => {
+                let Some(s) = &self.session else { return };
+                let mut candidates: Vec<Kid> = s.kids.clone();
+                candidates.sort_by_key(|k| (k.id != s.host, k.id));
+                self.handover = Some(Handover { candidates, spare });
+                self.toast("The host left: carrying on…".to_owned());
+            }
+        }
+    }
+
+    /// Try the next kid in line for host, or become it.
+    fn step_handover(&mut self) {
+        if self.link.is_some() {
+            return; // waiting to hear back
+        }
+        let (Some(h), Some(s)) = (&mut self.handover, &self.session) else {
+            return;
+        };
+        let Some(next) = h.candidates.first().cloned() else {
+            self.leave_together();
+            self.error = Some("The drawing ended: the host left.".into());
+            return;
+        };
+        let (name, color, ctx) = (self.me_name.clone(), self.me_color, self.ctx.clone());
+        if next.id == s.me {
+            let listener = match h.spare.take() {
+                Some(l) => Ok(l),
+                None => net::listen(),
+            };
+            match listener.and_then(|l| Link::host_with(l, s.confirmed().clone(), name, color, ctx)) {
+                Ok(link) => {
+                    self.invite = link.hosting_at();
+                    self.link = Some(link);
+                }
+                Err(e) => {
+                    self.leave_together();
+                    self.error = Some(format!("Paint couldn't carry on the drawing.\n\n{e}"));
+                }
+            }
+        } else if next.id == s.host && next.addr.is_empty() {
+            h.candidates.remove(0);
+        } else {
+            match Link::join(next.addr.clone(), name, color, h.spare.take(), ctx) {
+                Ok(link) => self.link = Some(link),
+                Err(_) => _ = h.candidates.remove(0),
+            }
+        }
+    }
+
+    /// Send what I've drawn since last time.
+    fn flush_network(&mut self) {
+        if self.handover.is_some() {
+            return;
+        }
+        let out = self.net_outbox();
+        if let Some(link) = &self.link {
+            for msg in out {
+                link.send(msg);
+            }
+        }
+    }
+
+    fn together_tab(&mut self, ui: &mut Ui) {
+        self.discover();
+        let pal = Palette::of(ui);
+        ribbon::group(ui, Some("Draw together"), CONTENT_H, |ui| {
+            if self.link.is_none() {
+                let start = ribbon::big_button(ui, Icon::Together, "Start\ndrawing", false, false, true);
+                if start.on_hover_text("Let friends on this Wi-Fi draw on this picture with you").clicked() {
+                    self.start_together();
+                }
+                let join = ribbon::big_button(ui, Icon::JoinRoom, "Join a\ndrawing", false, false, true);
+                if join.on_hover_text("Draw on a friend's picture").clicked() {
+                    self.join_dialog = Some(String::new());
+                }
+            } else {
+                let leave = ribbon::big_button(ui, Icon::LeaveRoom, "Leave", false, false, true);
+                if leave.on_hover_text("Stop drawing together (you keep the picture)").clicked() {
+                    self.leave_together();
+                }
+            }
+        });
+        ribbon::group(ui, Some("Friends"), CONTENT_H, |ui| {
+            let kids: Vec<Kid> = self.session.as_ref().map(|s| s.kids.clone()).unwrap_or_default();
+            let me = self.session.as_ref().map(|s| s.me);
+            if kids.is_empty() {
+                let hint = if self.link.is_some() { "Connecting…" } else { "Start or join a drawing\nto draw with friends." };
+                ui.add_space(6.0);
+                ui.label(RichText::new(hint).color(pal.text_weak));
+                ui.add_space(6.0);
+            }
+            // Three columns at most; a big room's full list opens from the "more" button.
+            const SHOWN: usize = 9;
+            let label = |kid: &Kid| if Some(kid.id) == me { format!("{} (you)", kid.name) } else { kid.name.clone() };
+            for (i, column) in kids[..kids.len().min(SHOWN)].chunks(3).enumerate() {
+                if i > 0 {
+                    ui.add_space(16.0);
+                }
+                ui.vertical(|ui| {
+                    ui.add_space(2.0);
+                    for kid in column {
+                        kid_row(ui, &label(kid), kid.color, pal.text);
+                    }
+                });
+            }
+            if kids.len() > SHOWN {
+                ui.add_space(8.0);
+                let more = more_button(ui, &format!("+{}", kids.len() - SHOWN), &pal)
+                    .on_hover_text(format!("Everyone drawing ({})", kids.len()));
+                egui::Popup::menu(&more).show(|ui| {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(format!("Everyone drawing ({})", kids.len())).strong().color(pal.text));
+                    ui.add_space(6.0);
+                    // Up to seven names a column and four columns side by side; a bigger
+                    // room scrolls.
+                    let columns = kids.len().div_ceil(7).clamp(1, 4);
+                    ScrollArea::vertical().max_height(7.0 * 27.0).min_scrolled_height(7.0 * 27.0).show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            for (i, column) in kids.chunks(kids.len().div_ceil(columns)).enumerate() {
+                                if i > 0 {
+                                    ui.add_space(16.0);
+                                }
+                                ui.vertical(|ui| {
+                                    for kid in column {
+                                        kid_row(ui, &label(kid), kid.color, pal.text);
+                                    }
+                                });
+                            }
+                        });
+                    });
+                });
+            }
+        });
+        if let Some(addr) = self.invite {
+            ribbon::group(ui, Some("Invite"), CONTENT_H, |ui| {
+                ui.vertical(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Friends can join at").color(pal.text_weak));
+                    ui.label(RichText::new(addr.to_string()).size(16.0).strong().color(pal.text));
+                });
+                ui.add_space(6.0);
+            });
+        }
+        ribbon::group(ui, Some("Me"), CONTENT_H, |ui| {
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+                let editable = self.link.is_none();
+                ui.horizontal(|ui| {
+                    paint_avatar(ui, &self.me_name, self.me_color, 20.0);
+                    let edit = egui::TextEdit::singleline(&mut self.me_name).desired_width(130.0).char_limit(20);
+                    let resp = ui.add_enabled(editable, edit).on_hover_text("Your name, shown to friends");
+                    if resp.lost_focus() {
+                        self.me_name = names::tidy(&self.me_name);
+                        save_me(&self.me_name, self.me_color);
+                    }
+                });
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for c in names::COLORS {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(13.0), Sense::click());
+                        let color = Color32::from_rgb(c[0], c[1], c[2]);
+                        let chosen = c == self.me_color;
+                        ui.painter().circle_filled(rect.center(), 6.0, color);
+                        if chosen {
+                            ui.painter().circle_stroke(rect.center(), 6.0, Stroke::new(1.5, pal.text));
+                        }
+                        if editable && resp.clicked() {
+                            self.me_color = c;
+                            save_me(&self.me_name, self.me_color);
+                        }
+                    }
+                });
+            });
+            ui.add_space(6.0);
+        });
+    }
+
+    fn together_dialogs(&mut self, ctx: &Context) {
+        let pal = Palette::of_ctx(ctx);
+        if let Some(mut addr) = self.join_dialog.take() {
+            let mut join = false;
+            self.discover();
+            let nearby = self.discovery.as_ref().map(|d| d.nearby.clone()).unwrap_or_default();
+            let mut picked = None;
+            let (cancel, dismissed) = dialog(ctx, "join", "Join a drawing", 360.0, |ui| {
+                if nearby.is_empty() {
+                    ui.label(RichText::new("Looking for drawings on this Wi-Fi…").color(pal.text_weak));
+                } else {
+                    ui.label(RichText::new("Drawings nearby:").color(pal.text));
+                    ui.add_space(2.0);
+                    for n in &nearby {
+                        if nearby_row(ui, n, &pal).clicked() && n.compatible {
+                            picked = Some(n.addr.to_string());
+                        }
+                    }
+                }
+                ui.add_space(12.0);
+                ui.label(RichText::new("Can't see it? Type the address shown on your friend's Together tab:").color(pal.text_weak));
+                ui.add_space(4.0);
+                let field = ui.add(egui::TextEdit::singleline(&mut addr).hint_text("192.168.1.20").desired_width(f32::INFINITY));
+                join = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                if !join && ui.memory(|m| m.focused().is_none()) {
+                    field.request_focus();
+                }
+                ui.add_space(14.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let cancel = ui.add(theme::dialog_button("Cancel", false)).clicked();
+                    join |= ui.add_enabled(!addr.trim().is_empty(), theme::dialog_button("Join", true)).clicked();
+                    cancel
+                })
+                .inner
+            });
+            if let Some(addr) = picked {
+                self.request(Pending::Join(addr));
+            } else if join && !addr.trim().is_empty() {
+                self.request(Pending::Join(addr.trim().to_owned()));
+            } else if !(cancel || dismissed) {
+                self.join_dialog = Some(addr);
+            }
+        }
+        if let Some(action) = self.confirm_everyone.take() {
+            let mut go = false;
+            let (cancel, dismissed) = dialog(ctx, "everyone", "Paint", 380.0, |ui| {
+                let what = if matches!(action, Pending::New) { "Start a new picture" } else { "Open a picture" };
+                ui.label(RichText::new(format!("{what} for everyone drawing with you?")).color(pal.text));
+                ui.add_space(4.0);
+                ui.label(RichText::new("It replaces the picture on all your friends' screens too.").color(pal.text_weak));
+                ui.add_space(14.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let cancel = ui.add(theme::dialog_button("Cancel", false)).clicked();
+                    go = ui.add(theme::dialog_button("Continue", true)).clicked();
+                    cancel
+                })
+                .inner
+            });
+            if go {
+                self.perform(action);
+            } else if !(cancel || dismissed) {
+                self.confirm_everyone = Some(action);
+            }
+        }
+    }
+
+    /// What to send the hub: my finished edits, and (at most 30 times a second)
+    /// what I'm drawing right now and where my pointer is.
+    fn net_outbox(&mut self) -> Vec<ToHub> {
+        let now = self.ctx.input(|i| i.time);
+        self.net_outbox_at(now)
+    }
+
+    fn net_outbox_at(&mut self, now: f64) -> Vec<ToHub> {
+        let Some(s) = &mut self.session else {
+            return Vec::new();
+        };
+        let mut out = s.take_outbox();
+        if now - self.last_share < 1.0 / 30.0 {
+            return out;
+        }
+        self.last_share = now;
+        let changed = if self.tex_full { IRect::of_image(&self.img) } else { self.preview_dirty.union(self.tex_dirty) };
+        self.preview_dirty = IRect::EMPTY;
+        let tiles = s.preview_tiles(&self.img, changed);
+        if !tiles.is_empty() {
+            out.push(ToHub::Preview(tiles));
+        }
+        let tool = match self.tool {
+            Tool::Pencil => Held::Pencil,
+            Tool::Fill => Held::Fill,
+            Tool::Brush => Held::Brush,
+            Tool::Eraser => Held::Eraser,
+            Tool::Picker => Held::Picker,
+            _ => Held::Other,
+        };
+        let (color, size) = if tool == Held::Eraser { (self.secondary, self.size_eraser) } else { (self.primary, 0.0) };
+        out.extend(s.presence(Presence { at: self.pointer.map(|p| (p.x, p.y)), tool, color, size }));
+        out
+    }
+
+    /// A friend's edit changed `base` in `region`: put it under whatever I'm in
+    /// the middle of, then draw that on top again.
+    fn rebase(&mut self, region: Region) {
+        let Some(s) = &self.session else { return };
+        let base = &s.base;
+        let r = match region {
+            Region::Rect(r) if self.img.dimensions() == base.dimensions() => r,
+            // Only reached with nothing in progress (see `net_receive`).
+            _ => {
+                self.img = base.clone();
+                self.tex_full = true;
+                return;
+            }
+        };
+        if let Op::Stroke { snapshot, .. } = &mut self.op {
+            raster::copy_rect(snapshot, base, r);
+        }
+        if let Some(live) = &mut self.live_shape {
+            live.rebase(base, r);
+        }
+        if let Some(tb) = &mut self.text {
+            raster::copy_rect(&mut tb.snapshot, base, r);
+            tb.rendered = None;
+        }
+        let float = self.sel.as_mut().and_then(|sel| sel.float.as_mut());
+        let floating = float.is_some();
+        match float {
+            Some(f) => {
+                raster::copy_rect(&mut f.before, base, r);
+                raster::copy_rect(&mut f.base, base, r);
+                // The hole stays Color 2, except where a friend has drawn into it since.
+                if let Some((lifted, color)) = &f.hole {
+                    lifted.each(|x, y, was| {
+                        if r.contains(pos2(x as f32, y as f32)) && base.get_pixel(x as u32, y as u32).0 == was {
+                            f.base.put_pixel(x as u32, y as u32, Rgba(*color));
+                        }
+                    });
+                }
+                raster::copy_rect(&mut self.img, &f.base, r);
+            }
+            None => raster::copy_rect(&mut self.img, base, r),
+        }
+        if let Op::Stroke { mask, color, opacity, dirty, .. } = &self.op {
+            raster::blend_mask(&mut self.img, mask, *color, *opacity, r.intersect(*dirty));
+        }
+        self.mark(r);
+        self.render_live_shape();
+        self.update_text_preview();
+        if floating {
+            self.refresh_float();
         }
     }
 
@@ -729,8 +1471,14 @@ impl PaintApp {
             }
             None => raster::fill_rect(&mut base, r, secondary),
         }
+        // Remember the lifted pixels, to redraw the hole if a friend draws under the selection.
+        let inside = sel.lasso.as_ref().map(|poly| lasso_mask(poly, r.width() as u32, r.height() as u32));
+        let hole = Patch::build(r, |x, y| {
+            inside.as_ref().is_none_or(|m| m.get(x - r.x0, y - r.y0) >= 0.5).then(|| before.get_pixel(x as u32, y as u32).0)
+        })
+        .map(|lifted| (lifted, secondary));
         sel.rect = r;
-        sel.float = Some(Floating { pixels, base, before, origin: r, canvas_changed: false });
+        sel.float = Some(Floating { pixels, base, before, origin: r, hole, canvas_changed: false });
     }
 
     fn move_float_to(&mut self, x: i32, y: i32) {
@@ -755,7 +1503,7 @@ impl PaintApp {
         let Some(sel) = self.sel.take() else { return };
         let Some(f) = sel.float else { return };
         if f.canvas_changed {
-            self.history.push(Change::Replace { before: f.before, after: self.img.clone() });
+            self.record(Change::Replace { before: f.before, after: self.img.clone() });
         } else {
             self.push_patch(&f.before, f.origin.union(sel.rect));
         }
@@ -768,7 +1516,7 @@ impl PaintApp {
             Some(f) => {
                 self.img = f.base;
                 if f.canvas_changed {
-                    self.history.push(Change::Replace { before: f.before, after: self.img.clone() });
+                    self.record(Change::Replace { before: f.before, after: self.img.clone() });
                     self.tex_full = true;
                 } else {
                     let region = f.origin.union(sel.rect);
@@ -867,7 +1615,7 @@ impl PaintApp {
         self.sel = Some(Selection {
             rect: IRect::new(x, y, x + pw as i32, y + ph as i32),
             lasso: None,
-            float: Some(Floating { pixels, base, before, origin: IRect::EMPTY, canvas_changed }),
+            float: Some(Floating { pixels, base, before, origin: IRect::EMPTY, hole: None, canvas_changed }),
         });
         self.tool = Tool::Select;
     }
@@ -887,7 +1635,7 @@ impl PaintApp {
         } else {
             let before = self.img.clone();
             self.img = f(&before);
-            self.history.push(Change::Replace { before, after: self.img.clone() });
+            self.record(Change::Replace { before, after: self.img.clone() });
             self.tex_full = true;
         }
     }
@@ -901,7 +1649,7 @@ impl PaintApp {
         }
         let before = self.img.clone();
         self.img = raster::crop(&before, r);
-        self.history.push(Change::Replace { before, after: self.img.clone() });
+        self.record(Change::Replace { before, after: self.img.clone() });
         self.tex_full = true;
         self.pending_scroll = Some(Vec2::ZERO);
     }
@@ -1291,7 +2039,7 @@ impl PaintApp {
                 if (nw, nh) != self.dims() {
                     let before = self.img.clone();
                     self.img = raster::resize_canvas(&before, nw, nh, self.secondary);
-                    self.history.push(Change::Replace { before, after: self.img.clone() });
+                    self.record(Change::Replace { before, after: self.img.clone() });
                     self.tex_full = true;
                 }
             }
@@ -1304,6 +2052,11 @@ impl PaintApp {
         let to_canvas = move |p: Pos2| pos2((p.x - crect.min.x) / zoom, (p.y - crect.min.y) / zoom);
         let (w, h) = self.dims();
         let hover = resp.hover_pos();
+        self.pointer = resp
+            .hover_pos()
+            .or_else(|| (!matches!(self.op, Op::Idle)).then(|| ctx.input(|i| i.pointer.latest_pos())).flatten())
+            .map(to_canvas)
+            .filter(|p| p.x >= 0.0 && p.y >= 0.0 && p.x <= w as f32 && p.y <= h as f32);
         self.cursor = hover
             .map(to_canvas)
             .filter(|p| p.x >= 0.0 && p.y >= 0.0 && p.x < w as f32 && p.y < h as f32)
@@ -1360,6 +2113,7 @@ impl PaintApp {
         }
         ctx.set_cursor_icon(match &self.op {
             _ if self.tool_cursor.is_some() => CursorIcon::None,
+            Op::Stroke { pen: Pen::Eraser, .. } if latest.is_some_and(|p| crect.contains(p)) => CursorIcon::None,
             Op::MovingSel { .. } | Op::ShapeMove { .. } => CursorIcon::Move,
             Op::ShapeHandle { handle, .. } => live_shape::handle_cursor(self.shape == ShapeKind::Line, *handle),
             Op::TextMove { .. } => CursorIcon::Move,
@@ -1411,6 +2165,11 @@ impl PaintApp {
             ctx.set_cursor_icon(CursorIcon::None);
             return;
         }
+        if self.tool == Tool::Eraser {
+            // The eraser's footprint (drawn with the canvas) is the pointer.
+            ctx.set_cursor_icon(CursorIcon::None);
+            return;
+        }
         let p = pos2((hp.x - crect.min.x) / self.zoom, (hp.y - crect.min.y) / self.zoom);
         ctx.set_cursor_icon(match self.tool {
             Tool::Select | Tool::FreeSelect if self.sel.as_ref().is_some_and(|s| s.rect.contains(p)) => CursorIcon::Move,
@@ -1421,12 +2180,19 @@ impl PaintApp {
     }
 
     fn sync_texture(&mut self, ctx: &Context) {
+        self.preview_dirty = if self.tex_full { IRect::of_image(&self.img) } else { self.preview_dirty.union(self.tex_dirty) };
+        // Friends' drawings in progress are part of the picture on screen (one
+        // texture, so zooming blends them exactly like everything else).
+        if let Some(s) = &mut self.session {
+            self.tex_dirty = self.tex_dirty.union(std::mem::replace(&mut s.overlay_dirty, IRect::EMPTY));
+        }
+        let friends = self.session.as_ref().filter(|s| s.has_previews()).map(|s| &s.overlay);
         let nearest = self.zoom >= 1.0;
         let opts = if nearest { TextureOptions::NEAREST } else { TextureOptions::LINEAR };
         let (w, h) = (self.img.width() as usize, self.img.height() as usize);
         let full = self.tex_full || nearest != self.tex_nearest || self.tex.as_ref().is_none_or(|t| t.size() != [w, h]);
         if full {
-            let image = ColorImage::from_rgba_unmultiplied([w, h], self.img.as_raw());
+            let image = ColorImage::from_rgba_unmultiplied([w, h], &with_friends(&self.img, friends, IRect::of_image(&self.img)));
             match &mut self.tex {
                 Some(t) => t.set(image, opts),
                 None => self.tex = Some(ctx.load_texture("canvas", image, opts)),
@@ -1436,17 +2202,65 @@ impl PaintApp {
         } else {
             let r = self.tex_dirty.intersect(IRect::of_image(&self.img));
             if let (false, Some(t)) = (r.is_empty(), &mut self.tex) {
-                let (rw, rh) = (r.width() as usize, r.height() as usize);
-                let raw = self.img.as_raw();
-                let mut buf = Vec::with_capacity(rw * rh * 4);
-                for y in r.y0 as usize..r.y1 as usize {
-                    let s = (y * w + r.x0 as usize) * 4;
-                    buf.extend_from_slice(&raw[s..s + rw * 4]);
-                }
-                t.set_partial([r.x0 as usize, r.y0 as usize], ColorImage::from_rgba_unmultiplied([rw, rh], &buf), opts);
+                let size = [r.width() as usize, r.height() as usize];
+                let image = ColorImage::from_rgba_unmultiplied(size, &with_friends(&self.img, friends, r));
+                t.set_partial([r.x0 as usize, r.y0 as usize], image, opts);
             }
         }
         self.tex_dirty = IRect::EMPTY;
+    }
+
+    /// Friends' pointers: their tool (or an arrow) in their colour, with their name.
+    fn paint_friends(&self, painter: &egui::Painter, crect: Rect) {
+        let Some(s) = &self.session else { return };
+        let now = self.ctx.input(|i| i.time);
+        let mut fading = false;
+        for (id, (p, since)) in &s.pointers {
+            let (Some((x, y)), Some(kid)) = (p.at, s.kids.iter().find(|k| k.id == *id)) else {
+                continue;
+            };
+            if now - since > 10.0 {
+                continue;
+            }
+            fading = true;
+            let at = crect.min + vec2(x, y) * self.zoom;
+            let [r, g, b] = kid.color;
+            let color = Color32::from_rgb(r, g, b);
+            match p.tool {
+                Held::Pencil => paint_tool_pointer(painter, Icon::Pencil, at),
+                Held::Fill => paint_tool_pointer(painter, Icon::Fill, at),
+                Held::Brush => paint_tool_pointer(painter, Icon::Brushes, at),
+                Held::Picker => paint_tool_pointer(painter, Icon::Picker, at),
+                Held::Eraser => {
+                    // Their eraser's footprint, filled with what it paints, outlined in their colour.
+                    let r = Rect::from_center_size(at, Vec2::splat((p.size * self.zoom).max(4.0)));
+                    painter.rect_filled(r, 0.0, c32(p.color));
+                    painter.rect_stroke(r, 0.0, Stroke::new(2.0, color), StrokeKind::Outside);
+                }
+                Held::Other => {
+                    let arrow = [
+                        vec2(0.0, 0.0),
+                        vec2(0.0, 16.0),
+                        vec2(4.2, 12.2),
+                        vec2(7.0, 18.0),
+                        vec2(9.4, 17.0),
+                        vec2(6.6, 11.2),
+                        vec2(12.0, 11.2),
+                    ];
+                    let pts: Vec<Pos2> = arrow.iter().map(|d| at + *d).collect();
+                    painter.add(egui::Shape::convex_polygon(pts[..3].iter().chain(&pts[5..]).copied().collect(), color, Stroke::NONE));
+                    painter.add(egui::Shape::convex_polygon(pts[2..6].to_vec(), color, Stroke::NONE));
+                    painter.add(egui::Shape::closed_line(pts, Stroke::new(1.2, Color32::WHITE)));
+                }
+            }
+            let galley = painter.layout_no_wrap(kid.name.clone(), FontId::proportional(11.5), Color32::WHITE);
+            let tag = Rect::from_min_size(at + vec2(10.0, 16.0), galley.size() + vec2(12.0, 5.0));
+            painter.rect_filled(tag, 7.0, color);
+            painter.galley(tag.min + vec2(6.0, 2.5), galley, Color32::WHITE);
+        }
+        if fading {
+            self.ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
     }
 
     // ---------------------------------------------------------------- UI
@@ -1740,7 +2554,7 @@ impl PaintApp {
                 self.file_menu_formats = false;
             }
             self.file_tab_rect = file.rect;
-            let mut tabs = vec![(Tab::Home, "Home", false), (Tab::View, "View", false)];
+            let mut tabs = vec![(Tab::Home, "Home", false), (Tab::View, "View", false), (Tab::Together, "Together", false)];
             if self.tool == Tool::Text {
                 tabs.push((Tab::Text, "Text", true));
             }
@@ -1798,6 +2612,7 @@ impl PaintApp {
                     match self.tab {
                         Tab::Home => self.home_tab(ui),
                         Tab::View => self.view_tab(ui),
+                        Tab::Together => self.together_tab(ui),
                         Tab::Text => self.text_tab(ui),
                     }
                 });
@@ -2245,6 +3060,17 @@ impl PaintApp {
                 Some(b) => ribbon::status_item(ui, Icon::FileSize, &format!("Size: {}", format_bytes(b)), 140.0),
                 None => _ = ui.allocate_exact_size(vec2(140.0, 22.0), Sense::hover()),
             }
+            // Drawing together: who's here, or a drawing nearby to join (shown left
+            // of the zoom controls, when there's room).
+            let invite = match (&self.session, &self.discovery) {
+                (None, Some(d)) => d.nearby.iter().find(|n| n.compatible).cloned(),
+                _ => None,
+            };
+            let together = self.session.as_ref().map(|s| match s.kids.len().saturating_sub(1) {
+                0 => "Waiting for friends".to_owned(),
+                1 => "Drawing with 1 friend".to_owned(),
+                n => format!("Drawing with {n} friends"),
+            });
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
@@ -2262,6 +3088,22 @@ impl PaintApp {
                     self.zoom_step(false, None);
                 }
                 ui.add_sized(vec2(44.0, 20.0), egui::Label::new(format!("{:.0}%", self.zoom * 100.0)));
+                ui.add_space(6.0);
+                let fits = |ui: &Ui, text: &str| {
+                    let w = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(12.0), Color32::BLACK).size().x + 36.0;
+                    (ui.available_width() >= w).then_some(w)
+                };
+                if let Some((text, w)) = together.and_then(|t| fits(ui, &t).map(|w| (t, w))) {
+                    ribbon::status_item(ui, Icon::Together, &text, w);
+                }
+                if let Some(n) = invite {
+                    let text = format!("Join {}'s drawing", n.name);
+                    if fits(ui, &text).is_some()
+                        && ribbon::status_link(ui, Icon::Together, &text).on_hover_text("A drawing nearby: draw on it together").clicked()
+                    {
+                        self.request(Pending::Join(n.addr.to_string()));
+                    }
+                }
             });
         });
     }
@@ -2447,6 +3289,7 @@ impl PaintApp {
                     self.render_live_shape();
                     self.sync_texture(&ctx);
                     self.paint_canvas(&painter, &resp, crect);
+                    self.paint_friends(&painter, crect);
                     if let Some((icon, p)) = self.tool_cursor {
                         paint_tool_pointer(&painter, icon, p);
                     }
@@ -2665,6 +3508,7 @@ impl PaintApp {
     }
 
     fn dialogs(&mut self, ctx: &Context) {
+        self.together_dialogs(ctx);
         if let Some(action) = self.confirm.clone() {
             let name = self.doc_name();
             let mut choice = None;
@@ -2819,7 +3663,7 @@ impl PaintApp {
                         self.commit_all();
                         let before = self.img.clone();
                         self.img = raster::resize_canvas(&before, nw, nh, self.secondary);
-                        self.history.push(Change::Replace { before, after: self.img.clone() });
+                        self.record(Change::Replace { before, after: self.img.clone() });
                         self.tex_full = true;
                     }
                 }
@@ -2989,7 +3833,8 @@ impl PaintApp {
     }
 
     fn update_title(&mut self, ctx: &Context) {
-        let title = format!("{}{} - Paint", if self.is_dirty() { "*" } else { "" }, self.doc_name());
+        let together = if self.session.is_some() { " (drawing together)" } else { "" };
+        let title = format!("{}{} - Paint{together}", if self.is_dirty() { "*" } else { "" }, self.doc_name());
         if title != self.title {
             ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
             self.title = title;
@@ -3013,12 +3858,14 @@ impl eframe::App for PaintApp {
         if let Some(path) = dropped {
             self.request(Pending::Open(Some(path)));
         }
+        self.pump_network();
         self.handle_keys(&ctx);
 
         let p = Palette::of(ui);
         if self.full_screen {
             self.full_screen_view(ui);
             self.dialogs(&ctx);
+            self.flush_network();
             return;
         }
         egui::Panel::top("titlebar")
@@ -3042,7 +3889,9 @@ impl eframe::App for PaintApp {
         self.thumbnail(&ctx);
         self.update_text_preview();
         self.dialogs(&ctx);
+        self.paint_toasts(&ctx);
         self.update_title(&ctx);
+        self.flush_network();
         if self.tex_full || !self.tex_dirty.is_empty() || !matches!(self.op, Op::Idle) {
             ctx.request_repaint();
         }
@@ -3075,12 +3924,38 @@ fn text_handle_at(bounds: Rect, p: Pos2, tol: f32, zoom: f32) -> Option<usize> {
     [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()].iter().position(|c| (p - *c).abs().max_elem() <= tol)
 }
 
+/// The pixels of `r` in `img`, with friends' drawing-in-progress (`overlay`,
+/// transparent where there is none) on top.
+fn with_friends(img: &RgbaImage, overlay: Option<&RgbaImage>, r: IRect) -> Vec<u8> {
+    let (w, rw) = (img.width() as usize, r.width() as usize);
+    let raw = img.as_raw();
+    let mut buf = Vec::with_capacity(rw * r.height() as usize * 4);
+    for y in r.y0 as usize..r.y1 as usize {
+        let i = (y * w + r.x0 as usize) * 4;
+        buf.extend_from_slice(&raw[i..i + rw * 4]);
+    }
+    if let Some(over) = overlay.filter(|o| o.dimensions() == img.dimensions()) {
+        let over = over.as_raw();
+        for (row, y) in (r.y0 as usize..r.y1 as usize).enumerate() {
+            for col in 0..rw {
+                let i = (y * w + r.x0 as usize + col) * 4;
+                if over[i + 3] > 0 {
+                    let o = (row * rw + col) * 4;
+                    buf[o..o + 4].copy_from_slice(&over[i..i + 4]);
+                }
+            }
+        }
+    }
+    buf
+}
+
 /// Tools whose mouse pointer is their own icon, as in Paint.
 fn tool_pointer(tool: Tool) -> Option<Icon> {
     match tool {
         Tool::Pencil => Some(Icon::Pencil),
         Tool::Fill => Some(Icon::Fill),
         Tool::Brush => Some(Icon::Brushes),
+        Tool::Picker => Some(Icon::Picker),
         _ => None,
     }
 }
@@ -3090,7 +3965,7 @@ fn paint_tool_pointer(painter: &egui::Painter, icon: Icon, p: Pos2) {
     const SIZE: f32 = 24.0;
     // The tip on the icon's 20×20 grid.
     let tip = match icon {
-        Icon::Pencil => vec2(2.5, 17.5),
+        Icon::Pencil | Icon::Picker => vec2(2.5, 17.5),
         Icon::Brushes => vec2(3.0, 18.4),
         _ => vec2(17.9, 18.6), // the drop of paint pouring from the bucket
     };
@@ -3098,13 +3973,14 @@ fn paint_tool_pointer(painter: &egui::Painter, icon: Icon, p: Pos2) {
     icons::paint_halo(icon, painter, Rect::from_min_size(min, Vec2::splat(SIZE)));
 }
 
-/// Image pixels between gridlines: every pixel from 400% up, as in Paint;
-/// below that, the smallest power of two that keeps lines at least 8 points apart.
+/// Image pixels between gridlines: every pixel from 400% up, as in Paint; below
+/// that every 8 pixels (so the grid grows as you zoom in), or a larger power of
+/// two when zoomed out far enough that lines would be under 8 points apart.
 fn grid_step(zoom: f32) -> u32 {
     if zoom >= 4.0 {
         return 1;
     }
-    let mut step = 1;
+    let mut step = 8;
     while (step as f32) * zoom < 8.0 {
         step *= 2;
     }
@@ -3450,6 +4326,27 @@ fn recent_file() -> Option<PathBuf> {
         std::path::Path::new(&home).join(".config/paint-rust")
     };
     Some(dir.join("recent.txt"))
+}
+
+fn me_file() -> Option<PathBuf> {
+    recent_file().map(|f| f.with_file_name("me.txt"))
+}
+
+/// My name and colour for drawing together, as last chosen.
+fn load_me() -> Option<(String, [u8; 3])> {
+    let text = std::fs::read_to_string(me_file()?).ok()?;
+    let mut lines = text.lines();
+    let name = names::tidy(lines.next()?);
+    let c: Vec<u8> = lines.next()?.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    (c.len() == 3).then(|| (name, [c[0], c[1], c[2]]))
+}
+
+fn save_me(name: &str, [r, g, b]: [u8; 3]) {
+    let Some(file) = me_file() else { return };
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, format!("{name}\n{r},{g},{b}\n"));
 }
 
 fn load_recent() -> Vec<PathBuf> {
@@ -3848,7 +4745,7 @@ mod tests {
         let mut a = app();
         let ctx = a.ctx.clone();
         let screen = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 700.0));
-        let mut frame = |a: &mut PaintApp, events: Vec<Event>| {
+        let frame = |a: &mut PaintApp, events: Vec<Event>| {
             let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
             let mut out = ctx.run_ui(input, |ui| a.canvas(ui));
             out.textures_delta.clear();
@@ -3856,11 +4753,15 @@ mod tests {
         };
         frame(&mut a, vec![]);
         let over = a.canvas_rect.min + vec2(20.0, 20.0);
-        for (tool, icon) in [(Tool::Pencil, Icon::Pencil), (Tool::Fill, Icon::Fill), (Tool::Brush, Icon::Brushes)] {
+        for (tool, icon) in [(Tool::Pencil, Icon::Pencil), (Tool::Fill, Icon::Fill), (Tool::Brush, Icon::Brushes), (Tool::Picker, Icon::Picker)] {
             a.tool = tool;
             assert_eq!(frame(&mut a, vec![Event::PointerMoved(over)]), CursorIcon::None, "{tool:?}");
             assert_eq!(a.tool_cursor, Some((icon, over)));
         }
+        // The eraser shows just its footprint: no crosshair, no icon.
+        a.tool = Tool::Eraser;
+        assert_eq!(frame(&mut a, vec![Event::PointerMoved(over)]), CursorIcon::None);
+        assert_eq!(a.tool_cursor, None);
         a.tool = Tool::Shape;
         assert_eq!(frame(&mut a, vec![Event::PointerMoved(over)]), CursorIcon::Crosshair);
         assert_eq!(a.tool_cursor, None);
@@ -3874,8 +4775,8 @@ mod tests {
     fn gridlines_show_at_every_zoom() {
         assert_eq!(grid_step(1.0), 8);
         assert_eq!(grid_step(0.5), 16);
-        assert_eq!(grid_step(2.0), 4);
-        assert_eq!(grid_step(3.0), 4);
+        assert_eq!(grid_step(2.0), 8);
+        assert_eq!(grid_step(3.0), 8);
         assert_eq!(grid_step(4.0), 1);
         assert_eq!(grid_step(8.0), 1);
         assert_eq!(grid_step(0.125), 64);
@@ -3977,4 +4878,590 @@ mod tests {
         let after = (a.pending_scroll.unwrap() + anchor - Vec2::splat(MARGIN)) / a.zoom;
         assert!((before - after).length() < 1e-3, "{before:?} vs {after:?}");
     }
+
+    /// Several kids in one room, with every message in flight held in queues so a
+    /// test decides exactly when each one arrives.
+    mod together {
+        use std::collections::VecDeque;
+
+        use super::*;
+        use crate::collab::hub::{Hub, To};
+        use crate::collab::protocol::PeerId;
+
+        struct Room {
+            hub: Hub,
+            kids: Vec<(PeerId, PaintApp)>,
+            /// Each kid's messages on their way to the hub, and the hub's on their way to each kid.
+            up: Vec<VecDeque<ToHub>>,
+            down: Vec<VecDeque<FromHub>>,
+            /// Friends' edits that arrived mid-stroke, over a live shape, text box
+            /// or floating selection: the cases where rebasing matters.
+            busy: [u32; 4],
+            /// Advances with every send, so previews and pointers go out each time.
+            clock: f64,
+        }
+
+        impl Room {
+            fn new(n: usize) -> Room {
+                let mut room =
+                    Room { hub: Hub::new(app().img), kids: Vec::new(), up: Vec::new(), down: Vec::new(), busy: [0; 4], clock: 0.0 };
+                for _ in 0..n {
+                    room.join();
+                }
+                room
+            }
+
+            fn join(&mut self) {
+                let id = self.kids.len() as PeerId + 1;
+                let out = self.hub.join(id, format!("Kid {id}"), [200, 50, 50], String::new());
+                self.kids.push((id, app()));
+                self.up.push(VecDeque::new());
+                self.down.push(VecDeque::new());
+                self.route(out);
+                let i = self.kids.len() - 1;
+                self.kid_gets(i);
+            }
+
+            fn route(&mut self, out: Vec<(To, FromHub)>) {
+                for (to, msg) in out {
+                    for (i, (id, _)) in self.kids.iter().enumerate() {
+                        let wanted = match to {
+                            To::One(k) => k == *id,
+                            To::All => true,
+                            To::Others(k) => k != *id,
+                        };
+                        if wanted {
+                            self.down[i].push_back(msg.clone());
+                        }
+                    }
+                }
+            }
+
+            fn kid(&mut self, i: usize) -> &mut PaintApp {
+                &mut self.kids[i].1
+            }
+
+            /// Hand the hub kid `i`'s next message.
+            fn hub_takes(&mut self, i: usize) -> bool {
+                self.clock += 0.05;
+                let out = self.kids[i].1.net_outbox_at(self.clock);
+                self.up[i].extend(out);
+                let Some(msg) = self.up[i].pop_front() else {
+                    return false;
+                };
+                let out = self.hub.handle(self.kids[i].0, msg);
+                self.route(out);
+                true
+            }
+
+            /// Hand kid `i` the hub's next message for them.
+            fn kid_gets(&mut self, i: usize) -> bool {
+                let Some(msg) = self.down[i].pop_front() else {
+                    return false;
+                };
+                let a = &self.kids[i].1;
+                if matches!(&msg, FromHub::Sequenced { from, .. } if *from != self.kids[i].0) {
+                    let float = a.sel.as_ref().is_some_and(|s| s.float.is_some());
+                    for (n, busy) in
+                        [matches!(a.op, Op::Stroke { .. }), a.live_shape.is_some(), a.text.is_some(), float].into_iter().enumerate()
+                    {
+                        self.busy[n] += busy as u32;
+                    }
+                }
+                self.kids[i].1.net_receive(msg);
+                true
+            }
+
+            /// Deliver everything in flight.
+            fn quiesce(&mut self) {
+                loop {
+                    let mut moved = false;
+                    for i in 0..self.kids.len() {
+                        while self.hub_takes(i) {
+                            moved = true;
+                        }
+                        while self.kid_gets(i) {
+                            moved = true;
+                        }
+                    }
+                    if !moved {
+                        break;
+                    }
+                }
+            }
+
+            /// Everyone finishes what they're doing; then every screen must match the hub's picture exactly.
+            fn assert_converged(&mut self) {
+                for i in 0..self.kids.len() {
+                    self.kid(i).settle();
+                }
+                self.quiesce();
+                let truth = self.hub.picture().clone();
+                for (i, (_, a)) in self.kids.iter().enumerate() {
+                    let s = a.session.as_ref().unwrap();
+                    assert_eq!(s.unconfirmed(), 0, "kid {i} still waiting on the hub");
+                    assert!(s.confirmed() == &truth, "kid {i}: confirmed picture differs from the hub's");
+                    assert!(s.base == truth, "kid {i}: base differs from the hub's");
+                    assert!(a.img == truth, "kid {i}: screen differs from the hub's");
+                    assert!(!s.has_previews(), "kid {i} still shows a friend's unfinished drawing");
+                }
+            }
+        }
+
+        fn line(a: &mut PaintApp, tool: Tool, color: Rgba8, from: (f32, f32), to: (f32, f32)) {
+            a.set_tool(tool);
+            a.primary = color;
+            drag(a, PointerButton::Primary, &[from, to]);
+        }
+
+        #[test]
+        fn joining_gets_the_hosts_picture() {
+            let mut room = Room::new(1);
+            line(room.kid(0), Tool::Pencil, RED, (10.0, 10.0), (100.0, 10.0));
+            room.quiesce();
+            room.join();
+            assert_eq!(px(room.kid(1), 50, 10), RED);
+            room.assert_converged();
+        }
+
+        #[test]
+        fn a_friends_stroke_goes_under_the_one_im_drawing() {
+            let mut room = Room::new(2);
+            // Kid 0 is halfway through a red line when kid 1's blue one arrives.
+            room.kid(0).set_tool(Tool::Pencil);
+            room.kid(0).primary = RED;
+            room.kid(0).size_pencil = 5.0;
+            room.kid(0).begin(pos2(10.0, 50.0), PointerButton::Primary, Vec2::ZERO);
+            room.kid(0).update(&[pos2(150.0, 50.0)], false, 1.0 / 60.0);
+            room.kid(1).size_pencil = 5.0;
+            line(room.kid(1), Tool::Pencil, BLUE, (80.0, 10.0), (80.0, 110.0));
+            room.quiesce();
+            assert_eq!(px(room.kid(0), 80, 20), BLUE, "the friend's line shows up");
+            assert_eq!(px(room.kid(0), 80, 50), RED, "my unfinished line stays on top");
+            room.kid(0).update(&[pos2(160.0, 50.0)], false, 1.0 / 60.0);
+            room.kid(0).end();
+            room.assert_converged();
+            assert_eq!(px(room.kid(1), 80, 50), RED);
+            assert_eq!(px(room.kid(1), 80, 20), BLUE);
+        }
+
+        #[test]
+        fn edits_crossing_on_the_network_end_up_identical() {
+            let mut room = Room::new(3);
+            // Everyone draws before seeing anyone else's work.
+            room.kid(0).size_pencil = 7.0;
+            room.kid(1).size_pencil = 7.0;
+            line(room.kid(0), Tool::Pencil, RED, (10.0, 60.0), (190.0, 60.0));
+            line(room.kid(1), Tool::Pencil, BLUE, (100.0, 5.0), (100.0, 115.0));
+            room.kid(2).set_tool(Tool::Fill);
+            room.kid(2).primary = [0, 160, 0, 255];
+            drag(room.kid(2), PointerButton::Primary, &[(5.0, 5.0)]);
+            // Kid 2's fill reaches the hub first, then kid 1's line, then kid 0's.
+            room.hub_takes(2);
+            room.hub_takes(1);
+            room.hub_takes(0);
+            room.assert_converged();
+            assert_eq!(px(room.kid(0), 100, 60), RED, "the last edit in the hub's order wins");
+        }
+
+        #[test]
+        fn undo_takes_back_only_my_own_pixels() {
+            let mut room = Room::new(2);
+            room.kid(0).size_pencil = 5.0;
+            room.kid(1).size_pencil = 5.0;
+            line(room.kid(0), Tool::Pencil, RED, (10.0, 50.0), (150.0, 50.0));
+            room.quiesce();
+            line(room.kid(1), Tool::Pencil, BLUE, (80.0, 10.0), (80.0, 110.0));
+            room.quiesce();
+            room.kid(0).undo();
+            room.assert_converged();
+            for i in 0..2 {
+                assert_eq!(px(room.kid(i), 40, 50), WHITE, "my line is gone");
+                assert_eq!(px(room.kid(i), 80, 50), BLUE, "where a friend drew over it, theirs stays");
+            }
+            room.kid(0).redo();
+            room.assert_converged();
+            assert_eq!(px(room.kid(1), 40, 50), RED);
+            assert_eq!(px(room.kid(1), 80, 50), BLUE);
+        }
+
+        #[test]
+        fn a_whole_picture_change_can_only_be_undone_until_friends_draw() {
+            let mut room = Room::new(2);
+            line(room.kid(0), Tool::Pencil, RED, (10.0, 10.0), (60.0, 10.0));
+            room.kid(0).transform(imageops::rotate180);
+            room.quiesce();
+            room.kid(0).undo();
+            room.assert_converged();
+            assert_eq!(px(room.kid(1), 30, 10), RED, "undone before anyone drew");
+            room.kid(0).redo();
+            room.quiesce();
+            line(room.kid(1), Tool::Pencil, BLUE, (10.0, 60.0), (60.0, 60.0));
+            room.quiesce();
+            room.kid(0).undo();
+            assert!(room.kid(0).error.is_some(), "too late");
+            room.kid(0).error = None;
+            room.assert_converged();
+            assert_eq!(px(room.kid(1), 30, 60), BLUE);
+        }
+
+        #[test]
+        fn a_friend_rotating_the_picture_finishes_what_im_drawing_first() {
+            let mut room = Room::new(2);
+            room.kid(0).set_tool(Tool::Pencil);
+            room.kid(0).begin(pos2(10.0, 10.0), PointerButton::Primary, Vec2::ZERO);
+            room.kid(0).update(&[pos2(50.0, 10.0)], false, 1.0 / 60.0);
+            room.kid(1).transform(imageops::rotate90);
+            room.quiesce();
+            assert!(matches!(room.kid(0).op, Op::Idle));
+            assert_eq!(room.kid(0).dims(), (120, 200));
+            room.assert_converged();
+        }
+
+        #[test]
+        fn a_friend_drawing_under_my_text_shows_through() {
+            let mut room = Room::new(2);
+            room.kid(0).set_tool(Tool::Text);
+            room.kid(0).text_style.size_pt = 24.0;
+            drag(room.kid(0), PointerButton::Primary, &[(20.0, 30.0)]);
+            type_events(room.kid(0), vec![Event::Text("Hello".into())]);
+            let bounds = room.kid(0).text.as_ref().unwrap().bounds;
+            let y = bounds.center().y;
+            room.kid(1).size_pencil = 3.0;
+            line(room.kid(1), Tool::Pencil, BLUE, (0.0, y), (199.0, y));
+            room.quiesce();
+            // Still typing: the friend's line runs through the text box.
+            assert!(room.kid(0).text.as_ref().unwrap().editing);
+            assert_eq!(px(room.kid(0), 5, y as u32), BLUE);
+            room.assert_converged();
+        }
+
+        #[test]
+        fn moving_a_selection_while_a_friend_draws_under_it() {
+            let mut room = Room::new(2);
+            room.kid(0).size_pencil = 8.0;
+            line(room.kid(0), Tool::Pencil, RED, (10.0, 20.0), (60.0, 20.0));
+            room.quiesce();
+            // Pick the red bar up and start dragging it down.
+            room.kid(0).set_tool(Tool::Select);
+            drag(room.kid(0), PointerButton::Primary, &[(5.0, 10.0), (66.0, 31.0)]);
+            room.kid(0).begin(pos2(30.0, 20.0), PointerButton::Primary, Vec2::ZERO);
+            room.kid(0).update(&[pos2(30.0, 80.0)], false, 1.0 / 60.0);
+            // A friend's diagonal line crosses where the bar was.
+            room.kid(1).size_pencil = 3.0;
+            line(room.kid(1), Tool::Pencil, BLUE, (20.0, 0.0), (60.0, 119.0));
+            room.quiesce();
+            let crossing = (20.0 + 40.0 * 20.0 / 119.0) as u32;
+            assert_eq!(px(room.kid(0), 50, 20), WHITE, "the hole stays empty, with no ghost of the bar");
+            assert_eq!(px(room.kid(0), crossing, 20), BLUE, "the friend's line through the hole stays");
+            room.kid(0).end();
+            room.assert_converged();
+            for i in 0..2 {
+                assert_eq!(px(room.kid(i), 50, 20), WHITE);
+                assert_eq!(px(room.kid(i), crossing, 20), BLUE);
+                assert_eq!(px(room.kid(i), 45, 80), RED, "the bar moved");
+            }
+        }
+
+        #[test]
+        fn friends_see_what_im_drawing_before_i_finish() {
+            let mut room = Room::new(2);
+            room.kid(0).set_tool(Tool::Pencil);
+            room.kid(0).primary = RED;
+            room.kid(0).size_pencil = 5.0;
+            room.kid(0).begin(pos2(10.0, 50.0), PointerButton::Primary, Vec2::ZERO);
+            room.kid(0).update(&[pos2(150.0, 50.0)], false, 1.0 / 60.0);
+            room.quiesce();
+            let s = room.kid(1).session.as_ref().unwrap();
+            assert!(s.has_previews());
+            assert_eq!(s.overlay.get_pixel(100, 50).0, RED, "shown over the picture");
+            assert_eq!(px(room.kid(1), 100, 50), WHITE, "but not part of it yet");
+            room.kid(0).update(&[pos2(150.0, 100.0)], false, 1.0 / 60.0);
+            room.quiesce();
+            assert_eq!(room.kid(1).session.as_ref().unwrap().overlay.get_pixel(150, 90).0, RED, "follows along");
+            room.kid(0).end();
+            room.assert_converged();
+            assert_eq!(px(room.kid(1), 100, 50), RED);
+            assert_eq!(room.kid(1).session.as_ref().unwrap().overlay.get_pixel(100, 50).0, [0; 4]);
+        }
+
+        #[test]
+        fn friends_drawing_is_merged_into_the_picture_on_screen() {
+            let img = RgbaImage::from_pixel(4, 2, Rgba(WHITE));
+            let mut over = RgbaImage::new(4, 2);
+            over.put_pixel(2, 1, Rgba(RED));
+            let shown = with_friends(&img, Some(&over), IRect::new(1, 0, 4, 2));
+            let px = |x: usize, y: usize| &shown[(y * 3 + x) * 4..(y * 3 + x) * 4 + 4];
+            assert_eq!(px(1, 1), RED, "the friend's pixel replaces mine");
+            assert_eq!(px(0, 1), WHITE, "elsewhere the picture shows through");
+            assert_eq!(px(2, 0), WHITE);
+        }
+
+        #[test]
+        fn a_text_box_thrown_away_disappears_for_friends_too() {
+            let mut room = Room::new(2);
+            room.kid(0).set_tool(Tool::Text);
+            drag(room.kid(0), PointerButton::Primary, &[(20.0, 30.0)]);
+            type_events(room.kid(0), vec![Event::Text("Hi".into())]);
+            room.quiesce();
+            assert!(room.kid(1).session.as_ref().unwrap().has_previews());
+            room.kid(0).discard_text();
+            room.quiesce();
+            assert!(!room.kid(1).session.as_ref().unwrap().has_previews());
+            room.assert_converged();
+        }
+
+        #[test]
+        fn kids_coming_and_going_are_announced() {
+            let mut room = Room::new(1);
+            room.join();
+            room.quiesce();
+            assert!(room.kid(0).toasts.iter().any(|t| t.text == "Kid 2 joined"));
+            let out = room.hub.leave(2);
+            room.route(out);
+            room.quiesce();
+            assert!(room.kid(0).toasts.iter().any(|t| t.text == "Kid 2 left"));
+        }
+
+        #[test]
+        fn a_crowd_arriving_is_one_notice() {
+            let mut room = Room::new(1);
+            for _ in 0..5 {
+                room.join();
+            }
+            room.quiesce();
+            let texts: Vec<&str> = room.kid(0).toasts.iter().map(|t| t.text.as_str()).collect();
+            assert_eq!(texts, ["5 friends joined"]);
+        }
+
+        #[test]
+        fn friends_see_my_pointer_and_tool() {
+            let mut room = Room::new(2);
+            room.kid(0).set_tool(Tool::Fill);
+            room.kid(0).pointer = Some(pos2(42.0, 17.0));
+            room.quiesce();
+            let me = room.kids[0].0;
+            let (p, _) = room.kid(1).session.as_ref().unwrap().pointers[&me];
+            assert_eq!(p.at, Some((42.0, 17.0)));
+            assert_eq!(p.tool, Held::Fill);
+            // The eraser goes with its size and Color 2; the colour picker by name.
+            room.kid(0).set_tool(Tool::Eraser);
+            room.kid(0).size_eraser = 8.0;
+            room.quiesce();
+            let (p, _) = room.kid(1).session.as_ref().unwrap().pointers[&me];
+            assert_eq!((p.tool, p.size, p.color), (Held::Eraser, 8.0, WHITE));
+            room.kid(0).set_tool(Tool::Picker);
+            room.quiesce();
+            assert_eq!(room.kid(1).session.as_ref().unwrap().pointers[&me].0.tool, Held::Picker);
+        }
+
+        /// Run every app's network side until `done` holds (or fail after a while).
+        fn run_until(kids: &mut [PaintApp], what: &str, done: impl Fn(&[PaintApp]) -> bool) {
+            for _ in 0..1500 {
+                for k in kids.iter_mut() {
+                    k.pump_network();
+                    k.flush_network();
+                }
+                if done(kids) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("timed out waiting until {what}");
+        }
+
+        #[test]
+        fn when_the_host_leaves_the_next_kid_takes_over() {
+            // Real sockets on this computer: kid 0 hosts, kids 1 and 2 join.
+            let mut kids: Vec<PaintApp> = (0..3).map(|_| app()).collect();
+            kids[0].start_together();
+            let port = kids[0].invite.expect("hosting").port();
+            run_until(&mut kids, "the host is in", |k| k[0].session.is_some());
+            for i in 1..3 {
+                kids[i].join_together(format!("127.0.0.1:{port}"));
+                run_until(&mut kids, "the kid is in", |k| k[i].session.is_some());
+            }
+            run_until(&mut kids, "everyone sees three kids", |k| k.iter().all(|a| a.session.as_ref().unwrap().kids.len() == 3));
+            line(&mut kids[1], Tool::Pencil, RED, (10.0, 20.0), (100.0, 20.0));
+            run_until(&mut kids, "kid 1's line reaches everyone", |k| k.iter().all(|a| a.img.get_pixel(50, 20).0 == RED));
+
+            // The host leaves; kid 1 (the first to join) takes over and kid 2 follows.
+            kids[0].leave_together();
+            run_until(&mut kids, "kid 1 is the host and kid 2 is with them", |k| {
+                let (a, b) = (k[1].session.as_ref().unwrap(), k[2].session.as_ref().unwrap());
+                a.host == a.me && b.host == a.me && b.kids.len() == 2 && k[2].handover.is_none()
+            });
+            assert!(kids[1].toasts.iter().any(|t| t.text == "You're the host now"));
+            assert_eq!(kids[2].img.get_pixel(50, 20).0, RED, "the picture carried over");
+
+            // Drawing carries on, both ways.
+            line(&mut kids[2], Tool::Pencil, BLUE, (10.0, 60.0), (100.0, 60.0));
+            line(&mut kids[1], Tool::Pencil, RED, (10.0, 90.0), (100.0, 90.0));
+            run_until(&mut kids, "both lines reach both", |k| {
+                k[1..].iter().all(|a| a.img.get_pixel(50, 60).0 == BLUE && a.img.get_pixel(50, 90).0 == RED)
+            });
+            assert!(kids[1].img == kids[2].img);
+        }
+
+        /// A tiny random generator, so each seed replays the same session.
+        struct Dice(u64);
+
+        impl Dice {
+            fn roll(&mut self, n: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % n
+            }
+
+            fn point(&mut self, a: &PaintApp) -> Pos2 {
+                let (w, h) = a.dims();
+                pos2(self.roll(w as u64) as f32 + 0.5, self.roll(h as u64) as f32 + 0.5)
+            }
+        }
+
+        /// One random thing a kid might do.
+        fn act(a: &mut PaintApp, dice: &mut Dice) {
+            if !matches!(a.op, Op::Idle) {
+                if dice.roll(3) == 0 {
+                    a.end();
+                } else {
+                    let p = dice.point(a);
+                    a.update(&[p], false, 1.0 / 60.0);
+                }
+                return;
+            }
+            let ([r, g, b], _) = PALETTE[dice.roll(PALETTE.len() as u64) as usize];
+            a.primary = [r, g, b, 255];
+            let p = dice.point(a);
+            match dice.roll(14) {
+                0..=2 => {
+                    a.set_tool(Tool::Pencil);
+                    a.size_pencil = 1.0 + dice.roll(8) as f32;
+                    a.begin(p, PointerButton::Primary, Vec2::ZERO);
+                }
+                3..=4 => {
+                    a.set_tool(Tool::Brush);
+                    a.brush = BrushKind::ALL[dice.roll(9) as usize];
+                    a.begin(p, PointerButton::Primary, Vec2::ZERO);
+                }
+                5 => {
+                    a.set_tool(Tool::Fill);
+                    drag(a, PointerButton::Primary, &[(p.x, p.y)]);
+                }
+                6 => {
+                    a.set_tool(Tool::Shape);
+                    a.shape = ShapeKind::ALL[dice.roll(21) as usize];
+                    a.begin(p, PointerButton::Primary, Vec2::ZERO);
+                }
+                7 => {
+                    a.set_tool(Tool::Text);
+                    drag(a, PointerButton::Primary, &[(p.x, p.y)]);
+                    type_events(a, vec![Event::Text("Hi".into())]);
+                }
+                8 => {
+                    // Select a box, then start dragging it somewhere else.
+                    a.set_tool(Tool::Select);
+                    let q = dice.point(a);
+                    drag(a, PointerButton::Primary, &[(p.x, p.y), (q.x, q.y)]);
+                    if let Some(r) = a.sel.as_ref().map(|s| s.rect) {
+                        let inside = pos2((r.x0 + r.x1) as f32 / 2.0, (r.y0 + r.y1) as f32 / 2.0);
+                        a.begin(inside, PointerButton::Primary, Vec2::ZERO);
+                    }
+                }
+                9 => a.commit_all(),
+                10 => a.undo(),
+                11 => a.redo(),
+                12 => match dice.roll(6) {
+                    0 => a.transform(imageops::rotate90),
+                    1 => a.transform(imageops::rotate180),
+                    2 => a.clear_image(),
+                    _ => a.transform(raster::invert),
+                },
+                _ => {}
+            }
+            a.error = None;
+        }
+
+        #[test]
+        fn random_sessions_always_end_up_identical() {
+            let mut busy = [0; 4];
+            for seed in 1..=24u64 {
+                let mut dice = Dice(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+                let mut room = Room::new(3);
+                for _ in 0..120 {
+                    let i = dice.roll(3) as usize;
+                    match dice.roll(5) {
+                        0 | 1 => act(room.kid(i), &mut dice),
+                        2 => _ = room.hub_takes(i),
+                        _ => _ = room.kid_gets(i),
+                    }
+                }
+                room.assert_converged();
+                for (total, n) in busy.iter_mut().zip(room.busy) {
+                    *total += n;
+                }
+            }
+            // Make sure the hard cases really happened.
+            println!("friends' edits arriving mid-stroke / over a live shape / text / floating selection: {busy:?}");
+            assert!(busy.iter().all(|&n| n >= 10), "{busy:?}");
+        }
+    }
+}
+
+/// A friend's coloured badge with their initial.
+fn paint_avatar(ui: &mut Ui, name: &str, [r, g, b]: [u8; 3], size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    ui.painter().circle_filled(rect.center(), size / 2.0, Color32::from_rgb(r, g, b));
+    let initial: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, initial, FontId::proportional(size * 0.6), Color32::WHITE);
+}
+
+/// One line in the Friends list.
+fn kid_row(ui: &mut Ui, name: &str, color: [u8; 3], text: Color32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        paint_avatar(ui, name, color, 16.0);
+        ui.label(RichText::new(name).color(text));
+    });
+}
+
+/// A drawing in the Join dialog's list: the host's badge, name and how many are drawing.
+fn nearby_row(ui: &mut Ui, n: &crate::collab::discovery::Nearby, pal: &Palette) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    let resp = resp.on_hover_cursor(if n.compatible { CursorIcon::PointingHand } else { CursorIcon::NotAllowed });
+    let painter = ui.painter();
+    if resp.hovered() && n.compatible {
+        painter.rect(rect, 4.0, pal.hover, Stroke::new(1.0, pal.hover_border), egui::StrokeKind::Inside);
+    }
+    let initial: String = n.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+    let badge = rect.left_center() + vec2(16.0, 0.0);
+    painter.circle_filled(badge, 10.0, Color32::from_rgb(0x4C, 0x9B, 0xE8));
+    painter.text(badge, Align2::CENTER_CENTER, initial, FontId::proportional(12.0), Color32::WHITE);
+    let kids = if n.kids == 1 { "1 kid".to_owned() } else { format!("{} kids", n.kids) };
+    let text = if n.compatible {
+        format!("{}'s drawing  ·  {kids}", n.name)
+    } else {
+        format!("{}'s drawing  (different version of Paint)", n.name)
+    };
+    let color = if n.compatible { pal.text } else { pal.text_weak };
+    painter.text(rect.left_center() + vec2(34.0, 0.0), Align2::LEFT_CENTER, text, FontId::proportional(13.0), color);
+    resp
+}
+
+/// A narrow button at the end of a short list, like the "more" arrow on Paint's
+/// galleries, with how many are hidden above it.
+fn more_button(ui: &mut Ui, count: &str, pal: &Palette) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(26.0, CONTENT_H - 8.0), Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    let painter = ui.painter();
+    if resp.hovered() || resp.is_pointer_button_down_on() {
+        painter.rect_filled(rect, ribbon::HIGHLIGHT_RADIUS, pal.hover);
+        painter.rect_stroke(rect, ribbon::HIGHLIGHT_RADIUS, Stroke::new(1.0, pal.hover_border), StrokeKind::Inside);
+    } else {
+        painter.rect_stroke(rect, ribbon::HIGHLIGHT_RADIUS, Stroke::new(1.0, pal.ribbon_border), StrokeKind::Inside);
+    }
+    painter.text(rect.center_top() + vec2(0.0, 16.0), Align2::CENTER_CENTER, count, FontId::proportional(11.0), pal.text);
+    icons::paint(Icon::GalleryMore, painter, icons::square(rect.center_bottom() - vec2(0.0, 14.0), 12.0), true);
+    resp
 }

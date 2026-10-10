@@ -115,6 +115,13 @@ impl LiveShape {
         region
     }
 
+    /// The picture under the shape changed in `r` (a friend drew there): use
+    /// theirs as the background and redraw on the next render.
+    pub fn rebase(&mut self, base: &RgbaImage, r: IRect) {
+        raster::copy_rect(&mut self.snapshot, base, r);
+        self.rendered = None;
+    }
+
     /// Put back what was under the shape; returns the pixels to refresh.
     pub fn erase(&self, img: &mut RgbaImage) -> IRect {
         raster::copy_rect(img, &self.snapshot, self.touched);

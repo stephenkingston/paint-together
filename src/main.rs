@@ -2,6 +2,7 @@
 
 mod app;
 mod brush;
+mod collab;
 mod history;
 mod icons;
 mod live_shape;
@@ -30,7 +31,12 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
-    let initial = first.map(std::path::PathBuf::from);
+    // `--join ADDRESS`: join a friend's drawing straight away; otherwise a picture to open.
+    let (initial, join) = if first.as_deref() == Some(std::ffi::OsStr::new("--join")) {
+        (None, args.next().and_then(|a| a.into_string().ok()))
+    } else {
+        (first.map(std::path::PathBuf::from), None)
+    };
     let icon = logo::render(256);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -46,5 +52,5 @@ fn main() -> eframe::Result {
             .with_icon(egui::IconData { width: icon.width(), height: icon.height(), rgba: icon.into_raw() }),
         ..Default::default()
     };
-    eframe::run_native("Paint", options, Box::new(move |cc| Ok(Box::new(app::PaintApp::new(cc, initial)))))
+    eframe::run_native("Paint", options, Box::new(move |cc| Ok(Box::new(app::PaintApp::new(cc, initial, join)))))
 }

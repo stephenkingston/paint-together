@@ -4,6 +4,8 @@ A from-scratch reimplementation of **classic Microsoft Paint** (the Windows 7 / 
 
 It recreates Paint's look and the way it behaves: the ribbon with its File menu and tabs, the tools and brushes, the shape gallery with shapes you can move and resize after drawing, typing straight onto the canvas, the Windows color dialog, rulers, and more. All of it runs natively on Linux, on both Wayland and X11.
 
+Kids on the same Wi-Fi can also **draw together on one picture, in real time**, with no server and no internet: one kid starts a drawing, and friends join it in a tap.
+
 ![Paint in action: brush strokes, a live shape being resized, a fill, typing on the canvas and moving a selection](docs/demo.gif)
 
 > **Not affiliated with Microsoft.** "Microsoft", "Windows" and "Paint" are trademarks of Microsoft Corporation. This project contains no Microsoft code, icons or other assets: every icon is drawn in code, and the app icon is original.
@@ -14,6 +16,7 @@ It recreates Paint's look and the way it behaves: the ribbon with its File menu 
 
 - [Screenshots](#screenshots)
 - [Features](#features)
+- [Drawing together](#drawing-together)
 - [Install](#install)
 - [Build from source](#build-from-source)
 - [Using Paint](#using-paint)
@@ -57,7 +60,7 @@ It recreates Paint's look and the way it behaves: the ribbon with its File menu 
 
 ### Drawing tools
 - **Pencil**: hard-edged lines, 1–20 px.
-- The mouse pointer turns into the tool itself for the Pencil, Fill and Brushes, with the tip exactly where the paint goes.
+- The mouse pointer turns into the tool itself for the Pencil, Fill, Brushes and Color picker, with the tip exactly where it works. The Eraser's pointer is just its square, in Color 2.
 - **Brushes**: nine types: Brush, Calligraphy 1 and 2, Airbrush (keeps spraying while you hold still), Oil, Crayon, Marker (translucent), Natural pencil and Watercolor.
 - **Fill with color**: flood fill with adjustable tolerance. It also reaches into the smoothed edges of outlines, so no pale ring is left between the fill and the outline.
 - **Eraser**: paints Color 2.
@@ -107,6 +110,29 @@ It recreates Paint's look and the way it behaves: the ribbon with its File menu 
 ### Native on Linux
 - Runs on **Wayland** and **X11**, scales on HiDPI screens, uses your system fonts (found through fontconfig), and opens your desktop's own Open/Save dialogs through the XDG desktop portal.
 - A self-contained binary with an app-launcher entry and icon; it doesn't depend on GTK or Qt.
+
+---
+
+## Drawing together
+
+Everything happens on the **Together** tab.
+
+1. One kid presses **Start drawing**. Their picture becomes the shared one.
+2. Friends on the same Wi-Fi press **Join a drawing** and tap it in the list (or click *Join Maya's drawing* in the status bar). If it doesn't show up, type the address shown on the host's Together tab, such as `192.168.1.20`.
+3. Everyone draws at once.
+
+What you get:
+- **See friends draw as they draw.** Strokes, shapes being dragged out, text being typed and selections being moved all show up live on everyone's screen. You also see each friend's pointer (their tool, in their colour, with their name).
+- **Every screen ends up identical.** The host's Paint puts every finished edit in one order and passes it on, and every app applies edits in that order. Edits travel as the pixels that changed, never as commands, so different computers, fonts or maths libraries can't make pictures drift apart.
+- **Undo takes back only your own work.** Anything a friend drew over it since stays.
+- **Anyone can change the whole picture** (New, Open, Rotate, Crop, Resize…). New and Open ask first, because they replace the picture on everyone's screen.
+- **If the host leaves, the drawing carries on.** The next kid's Paint takes over as host, and everyone reconnects to it automatically. Nobody's unfinished edits or undo history are lost.
+- **Fun names** ("Mighty Hedgehog") and colours, which you can change on the Together tab.
+- A small notice pops up when friends join or leave.
+
+From the command line, `paint --join 192.168.1.20` opens Paint and joins that drawing straight away.
+
+**Network:** drawing together uses TCP port **47100** (or another free port) for the drawing, and mDNS (UDP port **5353**) to find drawings nearby. Both stay on the local network. If a firewall blocks them, friends can't find or join the drawing; with `ufw`, for example, run `sudo ufw allow 47100/tcp` and `sudo ufw allow 5353/udp`. There is no join code: anyone on the same network can join a drawing they can see.
 
 ---
 
@@ -206,6 +232,12 @@ Paint is a single egui application. Some details worth knowing:
 - **Undo** stores the before and after pixels of just the rectangle each edit touched. Whole-image snapshots are used only when the canvas size changes.
 - **Icons are code.** Every ribbon icon is drawn as vectors on a 20×20 grid, so one design serves both 16 px and 32 px buttons. Straight edges are aligned to whole pixels so they stay sharp. The shape-gallery icons, the color wheel and the app icon are drawn with the canvas's own rasterizer and cached as textures.
 - **Text** is laid out and rasterized with [`ab_glyph`](https://crates.io/crates/ab_glyph) using your installed fonts, which it finds through fontconfig. Caret positions come from the same layout, so the caret lines up exactly with the drawn text.
+- **Drawing together without a server.** The host kid's Paint runs a small hub on a background thread. The hub numbers every finished edit and sends it to everyone, including the kid who made it.
+  - **Edits are pixels.** Each edit is a *masked pixel patch*: the changed pixels in a rectangle, plus a bit mask so untouched pixels are left alone. Patches are deflate-compressed and checked against size limits before use.
+  - **Three pictures per app.** Each app keeps the *confirmed* picture (every numbered edit, in order), a *base* (confirmed plus my edits still on their way to the hub), and the picture on screen (base plus whatever I'm in the middle of).
+  - **Rebasing.** When a friend's edit arrives, it goes into the base, and anything in progress (a stroke, live shape, text box or floating selection) is redrawn on top from its snapshot. That is the same order the hub gives everyone, so all screens end up identical.
+  - **Previews and undo.** Live previews are the 64×64 tiles where the screen differs from the base, sent up to 30 times a second. Undo sends a patch that restores my pixels only where the picture still shows them.
+  - **Finding and handing over.** mDNS finds drawings nearby, and heartbeats notice a vanished computer within seconds. Every guest keeps a port ready, so the earliest-joined kid can take over as host.
 
 ---
 
@@ -213,7 +245,7 @@ Paint is a single egui application. Some details worth knowing:
 
 | File | What's in it |
 |---|---|
-| `src/main.rs` | Entry point and window setup; `--export-icon PATH [SIZE]` (used for packaging) |
+| `src/main.rs` | Entry point and window setup; `--join ADDRESS`, and `--export-icon PATH [SIZE]` (used for packaging) |
 | `src/app.rs` | The app: state, tools, mouse and keyboard handling, ribbon tabs, menus, dialogs, canvas view |
 | `src/ribbon.rs` | Ribbon controls: big, small and split buttons, groups, tabs, menu rows, swatches, sliders |
 | `src/icons.rs` | Vector icons and their pixel-snapping drawing helpers |
@@ -226,6 +258,13 @@ Paint is a single egui application. Some details worth knowing:
 | `src/text_edit.rs` | Caret, selection, word/line movement and undo for on-canvas typing |
 | `src/history.rs` | Undo/redo |
 | `src/logo.rs` | The app icon, rendered in code |
+| `src/collab/mod.rs` | Drawing together: the confirmed / base / screen pictures, previews, friends' pointers |
+| `src/collab/patch.rs` | Masked pixel patches, and undoing only your own pixels |
+| `src/collab/hub.rs` | The host's coordinator: puts edits in order and keeps the true picture |
+| `src/collab/net.rs` | Framing, compression, the hub thread, connections and heartbeats |
+| `src/collab/protocol.rs` | The messages apps send each other |
+| `src/collab/discovery.rs` | Finding drawings nearby with mDNS |
+| `src/collab/names.rs` | Fun names and colours |
 | `src/tests.rs` | Pixel-engine tests (app-level tests live at the bottom of `app.rs`) |
 | `packaging/linux/` | The launcher entry (`paint.desktop`) and `install.sh`, shipped in the release |
 | `packaging/release-notes.md` | Notes published with each release |
@@ -239,13 +278,25 @@ Paint is a single egui application. Some details worth knowing:
 cargo test
 ```
 
-The suite of 35 tests covers:
+The suite of 54 tests covers:
 - **Pixel engine:** polygon coverage, anti-aliased capsules, flood fill boundaries, tolerance, and fills that reach anti-aliased edges without leaking.
 - **Undo history.**
 - **Shapes and brushes:** the geometry of every shape, and every brush.
 - **Tools, driven as the mouse drives them:** strokes with either mouse button, the eraser, shape outline and fill, live shapes (moving, resizing, restyling, deleting), selections (moving, free-form delete, transparent selection, rotating a selection), and pasting an image larger than the canvas.
 - **Text:** rendering, and on-canvas typing using real keyboard events (caret movement, word selection, undo, input-method text, paste, click-to-place-caret).
-- **Zoom** stays centered on the pointer.
+- **Zoom** stays centered on the pointer. **Gridlines** are spaced for every zoom level, and Pencil, Fill and Brushes use their own pointer.
+- **Drawing together:**
+  - **Simulated rooms.** Several Paints share one hub, and the tests decide exactly when every message arrives. Directed tests cover:
+    - a friend's stroke arriving while I'm mid-stroke;
+    - edits crossing on the network;
+    - drawing under my text box and under a selection I'm moving;
+    - a friend rotating the picture mid-stroke;
+    - undo leaving friends' pixels alone;
+    - previews and pointers.
+  - **Random sessions.** Randomized sessions of strokes, fills, shapes, text, moved selections, undo, redo and whole-picture changes, with messages arriving in random orders. Every screen must end up identical, byte for byte, with no friend's unfinished drawing left behind.
+  - **Real sockets.** Message framing and size limits, a host and a friend talking over real sockets, and a host leaving while the next kid takes over.
+
+One more test is run by hand across two computers: start a drawing on one, then on the other run `PAINT_JOIN=<address> cargo test joins_a_real_room -- --ignored --nocapture`.
 
 ---
 
@@ -257,6 +308,8 @@ The suite of 35 tests covers:
 - **Ctrl+V doesn't paste an image** when the clipboard holds only an image (no text), because the windowing layer swallows the keystroke. Use **Paste** on the ribbon or the right-click menu instead.
 - **Dropping files onto the window** works on X11 but not yet on Wayland. Use **Open**, or pass the file on the command line.
 - Without an XDG desktop portal, the Open and Save dialogs can't appear.
+- **Drawing together** works only on a local network. Some school or guest Wi-Fi networks keep devices apart; then nobody can join, even by address. When multicast is blocked, drawings don't show up in the list, but you can still join by typing the address.
+- If the host's computer crashes mid-stroke, the last moment of drawing that hadn't reached everyone may be lost when the next kid takes over.
 
 ---
 

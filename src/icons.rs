@@ -53,6 +53,10 @@ pub enum Icon {
     Properties,
     About,
     Exit,
+    /// Drawing together: two kids.
+    Together,
+    JoinRoom,
+    LeaveRoom,
     Undo,
     Redo,
     Help,
@@ -310,6 +314,30 @@ impl Pen<'_> {
         self.crisp(&body, Color32::TRANSPARENT, Some(DARK_BLUE));
     }
 
+    /// A kid's head and shoulders: `c` is the middle of the shoulders' base.
+    fn kid(&self, c: (f32, f32), r: f32, fill: Color32) {
+        let mut body = self.arc(c, r, PI, TAU);
+        body.push(self.p(c));
+        self.painter.add(Shape::convex_polygon(body.clone(), self.c(fill), Stroke::NONE));
+        body.pop();
+        let w = self.hairline().max(self.unit * 0.8);
+        self.painter.add(Shape::line(body, Stroke::new(w, self.c(INK))));
+        self.line(&[(c.0 - r, c.1), (c.0 + r, c.1)], INK, 0.8);
+        let head = (c.0, c.1 - r - r * 0.62);
+        self.disc(head, r * 0.6, self.c(fill));
+        self.ring(head, r * 0.6, INK, 0.8);
+    }
+
+    /// A door, with an arrow going in (towards the door) or out.
+    fn door(&self, door_x: (f32, f32), arrow: ((f32, f32), (f32, f32))) {
+        self.rect((door_x.0, 2.5), (door_x.1, 18.0), hex(0xE6C08A), Some(BROWN_DARK));
+        self.rect((door_x.0 + 1.5, 4.0), (door_x.1 - 1.5, 9.5), hex(0xF3D9A6), Some(BROWN_DARK));
+        self.disc((door_x.1 - 1.8, 11.5), 0.8, BROWN_DARK);
+        let (a, b) = arrow;
+        self.line(&[a, (b.0 - (b.0 - a.0).signum() * 2.0, b.1)], GREEN, 2.2);
+        self.arrow_head(self.p(b), vec2(b.0 - a.0, b.1 - a.1), 5.0, GREEN);
+    }
+
     fn magnifier(&self) {
         // Handle first, starting under the rim: a metal collar, then the wooden grip.
         // The lens and rim go on top, so nothing pokes into the glass.
@@ -547,6 +575,12 @@ fn paint_with(icon: Icon, painter: &Painter, rect: Rect, disabled: bool, solid: 
             pen.disc((14.5, 14.5), 4.2, GREEN);
             pen.line(&[(12.6, 14.6), (14.0, 16.0), (16.6, 13.2)], PAPER, 1.3);
         }
+        Icon::Together => {
+            pen.kid((6.8, 18.5), 5.2, hex(0xF4A62A));
+            pen.kid((13.6, 18.5), 5.6, hex(0x4C9BE8));
+        }
+        Icon::JoinRoom => pen.door((10.5, 18.0), ((1.0, 11.0), (12.5, 11.0))),
+        Icon::LeaveRoom => pen.door((2.0, 9.5), ((7.5, 11.0), (19.0, 11.0))),
         Icon::About | Icon::Help => {
             pen.disc((10.0, 10.0), 8.5, BLUE);
             let glyph = if icon == Icon::About { "i" } else { "?" };

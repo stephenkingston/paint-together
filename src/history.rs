@@ -77,6 +77,24 @@ impl History {
         true
     }
 
+    /// Undo (`back`) or redo one step, but only if `apply` performs it.
+    pub fn step_with(&mut self, back: bool, apply: impl FnOnce(&Change) -> bool) -> bool {
+        let (from, to) = if back { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
+        let Some(edit) = from.last() else {
+            return false;
+        };
+        if !apply(&edit.change) {
+            return false;
+        }
+        to.push(from.pop().expect("checked above"));
+        true
+    }
+
+    /// Identifies the step `redo` would bring back.
+    pub fn redo_id(&self) -> u64 {
+        self.redo.last().map_or(0, |e| e.id)
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }

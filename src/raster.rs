@@ -67,6 +67,10 @@ impl IRect {
         Self::new(self.x0.max(o.x0), self.y0.max(o.y0), self.x1.min(o.x1), self.y1.min(o.y1))
     }
 
+    pub fn contains_rect(&self, o: IRect) -> bool {
+        o.x0 >= self.x0 && o.y0 >= self.y0 && o.x1 <= self.x1 && o.y1 <= self.y1
+    }
+
     pub fn contains(&self, p: Pos2) -> bool {
         p.x >= self.x0 as f32 && p.x < self.x1 as f32 && p.y >= self.y0 as f32 && p.y < self.y1 as f32
     }
