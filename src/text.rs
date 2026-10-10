@@ -97,6 +97,35 @@ fn scan_dirs(dirs: &[PathBuf], recursive: bool, by_name: &mut HashMap<String, Fo
     }
 }
 
+/// Windows font folders: file names are short (arialbd.ttf), so read each face's
+/// own family name and style from the font.
+#[cfg(windows)]
+fn scan_named(dirs: &[PathBuf], by_name: &mut HashMap<String, FontFamily>) {
+    use ttf_parser::{Face as TtfFace, Language, name_id};
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_font_file(&path) {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&path) else { continue };
+            for index in 0..ttf_parser::fonts_in_collection(&data).unwrap_or(1) {
+                let Ok(face) = TtfFace::parse(&data, index) else { continue };
+                let names: Vec<_> = face.names().into_iter().filter(|n| n.name_id == name_id::FAMILY && n.is_unicode()).collect();
+                let family = names
+                    .iter()
+                    .find(|n| n.language() == Language::English_UnitedStates)
+                    .or(names.first())
+                    .and_then(|n| n.to_string());
+                if let Some(family) = family.filter(|f| !f.is_empty()) {
+                    add_face(by_name, &family, face.is_bold(), face.is_italic(), Face { path: path.clone(), index });
+                }
+            }
+        }
+    }
+}
+
 /// Ask fontconfig (Linux and other Unixes) for every installed face with its real
 /// family and style names. Returns false if fontconfig isn't available.
 fn scan_fontconfig(by_name: &mut HashMap<String, FontFamily>) -> bool {
@@ -148,7 +177,16 @@ impl FontLibrary {
     pub fn scan() -> Self {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut by_name: HashMap<String, FontFamily> = HashMap::new();
-        if cfg!(target_os = "macos") {
+        #[cfg(windows)]
+        {
+            let windir = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+            let mut dirs = vec![windir.join("Fonts")];
+            dirs.extend(std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join(r"Microsoft\Windows\Fonts")));
+            scan_named(&dirs, &mut by_name);
+        }
+        if cfg!(windows) {
+            // Done above.
+        } else if cfg!(target_os = "macos") {
             let mut dirs = vec![
                 PathBuf::from("/System/Library/Fonts/Supplemental"),
                 PathBuf::from("/System/Library/Fonts"),

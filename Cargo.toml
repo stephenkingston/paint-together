@@ -1,6 +1,6 @@
 [package]
 name = "paint-together"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Classic Windows Paint, rebuilt in Rust, where kids on the same Wi-Fi draw on one picture together in real time"
@@ -26,6 +26,11 @@ flate2 = "1"
 mdns-sd = "0.21"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff", "webp", "ico"] }
 rfd = "0.17"
+
+# Windows names its font files briefly (arialbd.ttf), so the Text tool reads
+# each font's own name table there.
+[target.'cfg(windows)'.dependencies]
+ttf-parser = "0.25"
 
 [profile.dev]
 opt-level = 1

@@ -1,5 +1,8 @@
 //! Paint: a from-scratch Rust reimplementation of the Windows Paint app.
 
+// A window of its own on Windows, without a console window behind it.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod brush;
 mod collab;

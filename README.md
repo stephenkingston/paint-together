@@ -78,6 +78,8 @@ cd paint-<version>-linux-x86_64
 ./install.sh            # install it for your user
 ```
 
+Each release also has builds for Windows and macOS; its notes say how to open them.
+
 `install.sh` doesn't need root. It copies the binary to `~/.local/bin/paint`, and adds the icon and a *Paint* entry to your app launcher. To uninstall, delete `~/.local/bin/paint`, `~/.local/share/applications/paint.desktop` and `~/.local/share/icons/hicolor/256x256/apps/paint.png`. To check a download: `sha256sum -c paint-<version>-linux-x86_64.tar.gz.sha256`.
 
 ### Requirements

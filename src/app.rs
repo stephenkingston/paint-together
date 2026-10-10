@@ -4319,6 +4319,9 @@ fn local_utc_offset(_secs: i64) -> i64 {
 }
 
 fn recent_file() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Paint (Rust)").join("recent.txt"));
+    }
     let home = std::env::var_os("HOME")?;
     let dir = if cfg!(target_os = "macos") {
         std::path::Path::new(&home).join("Library/Application Support/Paint (Rust)")

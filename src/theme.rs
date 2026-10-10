@@ -120,6 +120,10 @@ fn install_fonts(ctx: &Context) {
             ("serif", at("/System/Library/Fonts/Supplemental/Times New Roman.ttf"), Some("serif")),
             ("serif-bold", at("/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf"), Some("serif-bold")),
         ]
+    } else if cfg!(windows) {
+        let fonts_dir = std::env::var_os("WINDIR").map_or_else(|| std::path::PathBuf::from(r"C:\Windows"), std::path::PathBuf::from).join("Fonts");
+        let at = |f: &str| Some((fonts_dir.join(f), 0));
+        vec![("system", at("segoeui.ttf"), None), ("serif", at("times.ttf"), Some("serif")), ("serif-bold", at("timesbd.ttf"), Some("serif-bold"))]
     } else {
         // Whatever the desktop's fontconfig prefers.
         vec![
