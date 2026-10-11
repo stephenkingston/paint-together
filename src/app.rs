@@ -2354,7 +2354,7 @@ impl PaintApp {
         let (w, h) = (self.img.width() as usize, self.img.height() as usize);
         let full = self.tex_full || nearest != self.tex_nearest || self.tex.as_ref().is_none_or(|t| t.size() != [w, h]);
         if full {
-            let image = ColorImage::from_rgba_unmultiplied([w, h], &with_friends(&self.img, friends, IRect::of_image(&self.img)));
+            let image = with_friends(&self.img, friends, IRect::of_image(&self.img));
             match &mut self.tex {
                 Some(t) => t.set(image, opts),
                 None => self.tex = Some(ctx.load_texture("canvas", image, opts)),
@@ -2364,9 +2364,7 @@ impl PaintApp {
         } else {
             let r = self.tex_dirty.intersect(IRect::of_image(&self.img));
             if let (false, Some(t)) = (r.is_empty(), &mut self.tex) {
-                let size = [r.width() as usize, r.height() as usize];
-                let image = ColorImage::from_rgba_unmultiplied(size, &with_friends(&self.img, friends, r));
-                t.set_partial([r.x0 as usize, r.y0 as usize], image, opts);
+                t.set_partial([r.x0 as usize, r.y0 as usize], with_friends(&self.img, friends, r), opts);
             }
         }
         self.tex_dirty = IRect::EMPTY;
@@ -4081,27 +4079,22 @@ fn text_handle_at(bounds: Rect, p: Pos2, tol: f32, zoom: f32) -> Option<usize> {
 
 /// The pixels of `r` in `img`, with friends' drawing-in-progress (`overlay`,
 /// transparent where there is none) on top.
-fn with_friends(img: &RgbaImage, overlay: Option<&RgbaImage>, r: IRect) -> Vec<u8> {
+fn with_friends(img: &RgbaImage, overlay: Option<&RgbaImage>, r: IRect) -> ColorImage {
     let (w, rw) = (img.width() as usize, r.width() as usize);
-    let raw = img.as_raw();
-    let mut buf = Vec::with_capacity(rw * r.height() as usize * 4);
+    let (raw, over) = (img.as_raw(), overlay.filter(|o| o.dimensions() == img.dimensions()).map(|o| o.as_raw()));
+    let color = |p: &[u8]| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]);
+    // Straight into the texture's pixels: a big picture is copied once on its way to the screen, not twice.
+    let mut pixels = Vec::with_capacity(rw * r.height() as usize);
     for y in r.y0 as usize..r.y1 as usize {
-        let i = (y * w + r.x0 as usize) * 4;
-        buf.extend_from_slice(&raw[i..i + rw * 4]);
-    }
-    if let Some(over) = overlay.filter(|o| o.dimensions() == img.dimensions()) {
-        let over = over.as_raw();
-        for (row, y) in (r.y0 as usize..r.y1 as usize).enumerate() {
-            for col in 0..rw {
-                let i = (y * w + r.x0 as usize + col) * 4;
-                if over[i + 3] > 0 {
-                    let o = (row * rw + col) * 4;
-                    buf[o..o + 4].copy_from_slice(&over[i..i + 4]);
-                }
-            }
+        let row = (y * w + r.x0 as usize) * 4..(y * w + r.x1 as usize) * 4;
+        match over {
+            None => pixels.extend(raw[row].chunks_exact(4).map(color)),
+            Some(over) => pixels.extend(
+                raw[row.clone()].chunks_exact(4).zip(over[row].chunks_exact(4)).map(|(mine, theirs)| color(if theirs[3] > 0 { theirs } else { mine })),
+            ),
         }
     }
-    buf
+    ColorImage::new([rw, r.height() as usize], pixels)
 }
 
 /// Tools whose mouse pointer is their own icon, as in Paint.
@@ -5374,10 +5367,21 @@ mod tests {
             let mut over = RgbaImage::new(4, 2);
             over.put_pixel(2, 1, Rgba(RED));
             let shown = with_friends(&img, Some(&over), IRect::new(1, 0, 4, 2));
-            let px = |x: usize, y: usize| &shown[(y * 3 + x) * 4..(y * 3 + x) * 4 + 4];
+            assert_eq!(shown.size, [3, 2]);
+            let px = |x: usize, y: usize| shown.pixels[y * 3 + x].to_array();
             assert_eq!(px(1, 1), RED, "the friend's pixel replaces mine");
             assert_eq!(px(0, 1), WHITE, "elsewhere the picture shows through");
             assert_eq!(px(2, 0), WHITE);
+        }
+
+        #[test]
+        fn the_picture_on_screen_is_the_picture_with_its_transparency() {
+            let img = RgbaImage::from_fn(5, 3, |x, y| Rgba([x as u8 * 50, y as u8 * 90, 7, (x * 60 + y * 5) as u8]));
+            let r = IRect::new(1, 1, 5, 3);
+            let src = &img;
+            let crop: Vec<u8> = (1..3).flat_map(|y| (1..5).flat_map(move |x| src.get_pixel(x, y).0)).collect();
+            let shown = with_friends(&img, None, r);
+            assert_eq!(shown.pixels, ColorImage::from_rgba_unmultiplied([4, 2], &crop).pixels);
         }
 
         #[test]

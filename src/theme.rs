@@ -110,10 +110,27 @@ pub fn install(ctx: &Context) {
     });
 }
 
-fn install_fonts(ctx: &Context) {
-    let mut fonts = FontDefinitions::default();
-    // (name, file and face index, named family it defines; None = the UI font)
-    let faces: Vec<(&str, Option<(std::path::PathBuf, u32)>, Option<&str>)> = if cfg!(target_os = "macos") {
+/// A UI font: its name, the font file's bytes, the face in the file, and the named family it defines (None = the UI font).
+type UiFont = (&'static str, &'static [u8], u32, Option<&'static str>);
+
+/// The UI fonts, read once and kept for the whole run. egui takes them borrowed:
+/// fonts it's given to own, it keeps twice (18 MB of them on a Mac).
+fn ui_fonts() -> &'static [UiFont] {
+    static FONTS: std::sync::OnceLock<Vec<UiFont>> = std::sync::OnceLock::new();
+    FONTS.get_or_init(|| {
+        font_files()
+            .into_iter()
+            .filter_map(|(name, face, family)| {
+                let (path, index) = face?;
+                let bytes = std::fs::read(path).ok()?;
+                Some((name, &*bytes.leak(), index, family))
+            })
+            .collect()
+    })
+}
+
+fn font_files() -> Vec<(&'static str, Option<(std::path::PathBuf, u32)>, Option<&'static str>)> {
+    if cfg!(target_os = "macos") {
         let at = |p: &str| Some((std::path::PathBuf::from(p), 0));
         vec![
             ("system", at("/System/Library/Fonts/SFNS.ttf"), None),
@@ -131,11 +148,13 @@ fn install_fonts(ctx: &Context) {
             ("serif", crate::text::fc_match("serif"), Some("serif")),
             ("serif-bold", crate::text::fc_match("serif:bold"), Some("serif-bold")),
         ]
-    };
-    for (name, face, family) in faces {
-        let Some((path, index)) = face else { continue };
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let mut data = FontData::from_owned(bytes);
+    }
+}
+
+fn install_fonts(ctx: &Context) {
+    let mut fonts = FontDefinitions::default();
+    for &(name, bytes, index, family) in ui_fonts() {
+        let mut data = FontData::from_static(bytes);
         data.index = index;
         fonts.font_data.insert(name.to_owned(), Arc::new(data));
         match family {

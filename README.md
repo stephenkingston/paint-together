@@ -172,7 +172,7 @@ On Windows, Paint draws with Direct3D 12, falling back to Windows' own software 
 - Opens PNG, JPEG, BMP, GIF, TIFF, WebP and ICO. Saves PNG, JPEG, BMP, GIF, TIFF and WebP.
 - You can also pass a picture on the command line, or drag one onto the window (on X11).
 - Asks before throwing away unsaved changes (on New, Open and Quit).
-- Unlimited undo/redo within a 1 GB memory budget. Each step stores only the pixels it changed.
+- Unlimited undo/redo within a 256 MB memory budget. Each step stores only the pixels it changed.
 
 ### Native on Linux
 - Runs on **Wayland** and **X11**, scales on HiDPI screens, uses your system fonts (found through fontconfig), and opens your desktop's own Open/Save dialogs through the XDG desktop portal.
@@ -301,12 +301,12 @@ Paint is a single egui application. Some details worth knowing:
 cargo test
 ```
 
-The suite of 65 tests covers:
+The suite of 66 tests (67 on Windows) covers:
 - **Pixel engine:** polygon coverage, anti-aliased capsules, flood fill boundaries, tolerance, and fills that reach anti-aliased edges without leaking.
 - **Undo history.**
 - **Shapes and brushes:** the geometry of every shape, and every brush.
 - **Tools, driven as the mouse drives them:** strokes with either mouse button, the eraser, shape outline and fill, live shapes (moving, resizing, restyling, deleting, stamping when another shape is picked), selections (moving, free-form delete, transparent selection, rotating a selection), and pasting an image larger than the canvas.
-- **Text:** rendering, and on-canvas typing using real keyboard events (caret movement, word selection, undo, input-method text, paste, click-to-place-caret).
+- **Text:** rendering, and on-canvas typing using real keyboard events (caret movement, word selection, undo, input-method text, paste, click-to-place-caret). On Windows, naming every installed font from a few small tables finds the same faces as reading the whole files.
 - **Zoom** stays centered on the pointer. **Gridlines** are spaced for every zoom level. Pencil, Fill, Brushes and Color picker use their own pointer, and the Eraser shows only its square.
 - **Drawing together:**
   - **Simulated rooms.** Several Paints share one hub, and the tests decide exactly when every message arrives. Directed tests cover:
@@ -318,7 +318,7 @@ The suite of 65 tests covers:
     - previews, pointers and friends' tools;
     - join and leave notices (a crowd arriving is one notice);
     - the host kicking a friend out, and friends waiting until the host lets them in (or doesn't);
-    - friends' drawings in progress merged into the picture on screen.
+    - friends' drawings in progress merged into the picture on screen, which keeps its transparency.
   - **Random sessions.** Randomized sessions of strokes, fills, shapes, text, moved selections, undo, redo and whole-picture changes, with messages arriving in random orders. Every screen must end up identical, byte for byte, with no friend's unfinished drawing left behind.
   - **The door.** Kicked-out kids have to ask to come back, only the host decides, and after a takeover everyone who was in comes straight back.
   - **Real sockets.** Message framing and size limits, a host and a friend talking over real sockets, a quiet friend staying connected while another chats, a friend waiting at the door (hearing nothing of the drawing) until let in and cut off when kicked out, and a host leaving while the next kid takes over.

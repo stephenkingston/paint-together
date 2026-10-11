@@ -32,6 +32,13 @@ rfd = "0.17"
 [target.'cfg(windows)'.dependencies]
 ttf-parser = "0.25"
 
+[profile.release]
+# A smaller download, and less of it to load into memory: the program is
+# optimized as a whole and keeps no symbols (crash reports still say where).
+lto = "fat"
+codegen-units = 1
+strip = true
+
 [profile.dev]
 opt-level = 1
 

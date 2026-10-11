@@ -5,8 +5,10 @@ use image::{RgbaImage, imageops};
 
 use crate::raster::{self, IRect};
 
-/// Total pixel bytes kept for undo before the oldest steps are dropped.
-const BUDGET_BYTES: usize = 1 << 30;
+/// Total pixel bytes kept for undo before the oldest steps are dropped. Modest, for
+/// computers with little memory: a step that changes the whole of a big photo
+/// keeps it twice (about 100 MB at 12 megapixels).
+const BUDGET_BYTES: usize = 256 << 20;
 
 pub enum Change {
     Patch { x: u32, y: u32, before: RgbaImage, after: RgbaImage },

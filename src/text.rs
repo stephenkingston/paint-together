@@ -101,7 +101,6 @@ fn scan_dirs(dirs: &[PathBuf], recursive: bool, by_name: &mut HashMap<String, Fo
 /// own family name and style from the font.
 #[cfg(windows)]
 fn scan_named(dirs: &[PathBuf], by_name: &mut HashMap<String, FontFamily>) {
-    use ttf_parser::{Face as TtfFace, Language, name_id};
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else { continue };
         for entry in entries.flatten() {
@@ -109,21 +108,49 @@ fn scan_named(dirs: &[PathBuf], by_name: &mut HashMap<String, FontFamily>) {
             if !is_font_file(&path) {
                 continue;
             }
-            let Ok(data) = std::fs::read(&path) else { continue };
-            for index in 0..ttf_parser::fonts_in_collection(&data).unwrap_or(1) {
-                let Ok(face) = TtfFace::parse(&data, index) else { continue };
-                let names: Vec<_> = face.names().into_iter().filter(|n| n.name_id == name_id::FAMILY && n.is_unicode()).collect();
-                let family = names
-                    .iter()
-                    .find(|n| n.language() == Language::English_UnitedStates)
-                    .or(names.first())
-                    .and_then(|n| n.to_string());
-                if let Some(family) = family.filter(|f| !f.is_empty()) {
-                    add_face(by_name, &family, face.is_bold(), face.is_italic(), Face { path: path.clone(), index });
-                }
+            for (index, family, bold, italic) in named_faces(&path) {
+                add_face(by_name, &family, bold, italic, Face { path: path.clone(), index });
             }
         }
     }
+}
+
+/// Each face in a font file: (index, family, bold, italic). Only the few small
+/// tables that say so are read, not the whole file: a fresh Windows has over
+/// 300 MB of fonts, which an old hard disk takes seconds to read at every start.
+#[cfg(windows)]
+pub(crate) fn named_faces(path: &Path) -> Vec<(u32, String, bool, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    use ttf_parser::{Language, RawFace, Style, Tag, name, name_id, os2};
+    let Ok(mut file) = std::fs::File::open(path) else { return Vec::new() };
+    // Every face's table directory comes first in the file.
+    let mut head = Vec::new();
+    if (&mut file).take(64 << 10).read_to_end(&mut head).is_err() {
+        return Vec::new();
+    }
+    let mut read = |offset: u32, len: u32| {
+        let mut buf = vec![0; len as usize];
+        file.seek(SeekFrom::Start(offset.into())).and_then(|_| file.read_exact(&mut buf)).ok().map(|_| buf)
+    };
+    let mut faces = Vec::new();
+    for index in 0..ttf_parser::fonts_in_collection(&head).unwrap_or(1).min(256) {
+        let Ok(raw) = RawFace::parse(&head, index) else { continue };
+        let table = |tag: &[u8; 4]| raw.table_records.into_iter().find(|t| t.tag == Tag::from_bytes(tag));
+        let (Some(names), Some(_)) = (table(b"name"), table(b"head")) else { continue };
+        let Some(names) = read(names.offset, names.length.min(1 << 20)) else { continue };
+        let Some(names) = name::Table::parse(&names) else { continue };
+        let names: Vec<_> = names.names.into_iter().filter(|n| n.name_id == name_id::FAMILY && n.is_unicode()).collect();
+        let family = names.iter().find(|n| n.language() == Language::English_UnitedStates).or(names.first()).and_then(|n| n.to_string());
+        let Some(family) = family.filter(|f| !f.is_empty()) else { continue };
+        // As ttf-parser's Face reads it: bold and italic from OS/2, or a slanted `post` angle.
+        let os2 = table(b"OS/2").and_then(|t| read(t.offset, t.length.min(4096)));
+        let os2 = os2.as_deref().and_then(os2::Table::parse);
+        let slanted = table(b"post").and_then(|t| read(t.offset, 8)).is_some_and(|p| p[4..8] != [0; 4]);
+        let bold = os2.is_some_and(|t| t.is_bold());
+        let italic = os2.is_some_and(|t| t.style() == Style::Italic) || slanted;
+        faces.push((index, family, bold, italic));
+    }
+    faces
 }
 
 /// Ask fontconfig (Linux and other Unixes) for every installed face with its real

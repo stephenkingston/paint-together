@@ -156,3 +156,32 @@ fn text_renders_with_a_system_font() {
     // Bold and italic resolve to real faces or fall back to synthesized ones.
     assert!(lib.load(fam, true, true).is_some());
 }
+
+/// Naming fonts from a few small tables finds the same faces as parsing whole fonts.
+#[cfg(windows)]
+#[test]
+fn windows_fonts_are_named_without_reading_whole_files() {
+    use ttf_parser::{Face, Language, name_id};
+    let dir = std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| r"C:\Windows".into())).join("Fonts");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(dir).expect("fonts folder").flatten() {
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if !matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
+            continue;
+        }
+        let data = std::fs::read(&path).unwrap();
+        let mut whole = Vec::new();
+        for index in 0..ttf_parser::fonts_in_collection(&data).unwrap_or(1) {
+            let Ok(face) = Face::parse(&data, index) else { continue };
+            let names: Vec<_> = face.names().into_iter().filter(|n| n.name_id == name_id::FAMILY && n.is_unicode()).collect();
+            let family = names.iter().find(|n| n.language() == Language::English_UnitedStates).or(names.first()).and_then(|n| n.to_string());
+            if let Some(family) = family.filter(|f| !f.is_empty()) {
+                whole.push((index, family, face.is_bold(), face.is_italic()));
+            }
+        }
+        assert_eq!(text::named_faces(&path), whole, "{}", path.display());
+        checked += whole.len();
+    }
+    assert!(checked > 20, "only {checked} faces");
+}
