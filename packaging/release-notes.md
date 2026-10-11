@@ -2,6 +2,13 @@ Classic Microsoft Paint (the Windows 7/10 ribbon edition), rebuilt in Rust, wher
 
 Also on crates.io: `cargo install paint-together` installs the `paint` command.
 
+### New in this release
+
+- **Approve who joins.** Next to **Start drawing**, untick **Let friends in without asking**, and each friend who wants to join shows up as a small notice with a green tick to let them in and a red cross to say no. It's ticked by default, so friends still come straight in.
+- **Kick out.** The host can hover a friend's name and click the cross to send them out; everyone sees "Blue Fox has been kicked out by Maya". A kicked-out kid has to ask to come back.
+- **Shapes:** picking another shape stamps the one you just drew and gets ready to draw the new one, instead of changing the shape still being edited.
+- Drawing together needs everyone on 0.3.0: this version can't join drawings with 0.2.x.
+
 ### Linux (x86_64)
 
 ```sh

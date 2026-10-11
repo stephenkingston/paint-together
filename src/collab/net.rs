@@ -120,18 +120,19 @@ pub fn listen() -> io::Result<TcpListener> {
 
 impl Link {
     /// Start a room with `picture`, listening for friends on the local network.
-    pub fn host(picture: RgbaImage, name: String, color: [u8; 3], ctx: Context) -> io::Result<Link> {
-        Self::host_with(listen()?, picture, name, color, ctx)
+    /// With `ask_first`, newcomers wait for me to let them in.
+    pub fn host(picture: RgbaImage, name: String, color: [u8; 3], ask_first: bool, ctx: Context) -> io::Result<Link> {
+        Self::host_with(listen()?, Hub::new(picture).with_door(ask_first, Vec::new()), name, color, ctx)
     }
 
-    /// Start a room on a listener that's already open (taking over as host).
-    pub fn host_with(listener: TcpListener, picture: RgbaImage, name: String, color: [u8; 3], ctx: Context) -> io::Result<Link> {
+    /// Run `hub` on a listener that's already open (taking over as host).
+    pub fn host_with(listener: TcpListener, hub: Hub, name: String, color: [u8; 3], ctx: Context) -> io::Result<Link> {
         let port = listener.local_addr()?.port();
         let (hub_tx, hub_rx) = mpsc::channel();
         let ids = Arc::new(AtomicU32::new(1));
         let stop = Arc::new(AtomicBool::new(false));
 
-        thread::Builder::new().name("paint-hub".into()).spawn(move || run_hub(Hub::new(picture), hub_rx))?;
+        thread::Builder::new().name("paint-hub".into()).spawn(move || run_hub(hub, hub_rx))?;
         {
             let (hub_tx, ids, stop, ctx) = (hub_tx.clone(), ids.clone(), stop.clone(), ctx.clone());
             thread::Builder::new().name("paint-listen".into()).spawn(move || {
@@ -298,51 +299,42 @@ fn run_hub(mut hub: Hub, events: Receiver<HubEvent>) {
             Ok(HubEvent::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         // Everyone hears from the room regularly, however busy it is with
-        // others, so a quiet connection isn't mistaken for a lost one.
+        // others, so a quiet connection (or one waiting at the door) isn't
+        // mistaken for a lost one.
         if Instant::now() >= next_ping {
-            out.push((To::All, FromHub::Ping));
+            out.push((To::Everyone, FromHub::Ping));
             next_ping = Instant::now() + PING_EVERY;
         }
-        let mut gone = Vec::new();
-        for (to, msg) in out {
+        while !out.is_empty() {
+            let mut gone = Vec::new();
             for (&id, sink) in &sinks {
-                let wanted = match to {
+                let mut mine = out.iter().filter(|(to, _)| match *to {
+                    To::Everyone => true,
                     To::One(k) => k == id,
-                    To::All => true,
-                    To::Others(k) => k != id,
-                };
-                if !wanted {
-                    continue;
-                }
-                let delivered = match sink {
-                    Sink::Local(_, _) if msg == FromHub::Ping => true,
-                    Sink::Local(tx, ctx) => {
-                        let ok = tx.send(LinkEvent::Message(msg.clone())).is_ok();
-                        ctx.request_repaint();
-                        ok
-                    }
-                    Sink::Remote(tx) => tx.send(msg.clone()).is_ok(),
-                };
-                if !delivered {
+                    To::All => hub.is_in(id),
+                    To::Others(k) => k != id && hub.is_in(id),
+                });
+                if !mine.all(|(_, msg)| deliver(sink, msg)) {
                     gone.push(id);
                 }
             }
+            // Those sent away (or not let in) hang up once their news is on its way.
+            sinks.retain(|id, _| hub.knows(*id) && !gone.contains(id));
+            out = gone.into_iter().flat_map(|id| hub.leave(id)).collect();
         }
-        for id in gone {
-            sinks.remove(&id);
-            let out = hub.leave(id);
-            for (_, msg) in out {
-                for sink in sinks.values() {
-                    match sink {
-                        Sink::Local(tx, ctx) => {
-                            let _ = tx.send(LinkEvent::Message(msg.clone()));
-                            ctx.request_repaint();
-                        }
-                        Sink::Remote(tx) => _ = tx.send(msg.clone()),
-                    }
-                }
-            }
+    }
+}
+
+/// Pass one of the hub's messages on; false when that kid's connection is gone.
+fn deliver(sink: &Sink, msg: &FromHub) -> bool {
+    match sink {
+        Sink::Local(_, _) if *msg == FromHub::Ping => true,
+        Sink::Local(tx, ctx) => {
+            let ok = tx.send(LinkEvent::Message(msg.clone())).is_ok();
+            ctx.request_repaint();
+            ok
         }
+        Sink::Remote(tx) => tx.send(msg.clone()).is_ok(),
     }
 }
 
@@ -423,7 +415,7 @@ mod tests {
     #[test]
     fn frames_round_trip_and_big_ones_are_compressed() {
         let pic = Picture { w: 300, h: 200, rgba: vec![255; 300 * 200 * 4] };
-        let msg = FromHub::Welcome { you: 3, host: 1, seq: 9, picture: pic, kids: vec![] };
+        let msg = FromHub::Welcome { you: 3, host: 1, seq: 9, picture: pic, kids: vec![], ask_first: false };
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
         assert!(buf.len() < 10_000, "a white picture compresses well: {} bytes", buf.len());
@@ -484,7 +476,7 @@ mod tests {
     fn a_quiet_friend_stays_connected_while_another_chats() {
         let ctx = Context::default();
         let white = RgbaImage::from_pixel(32, 32, image::Rgba([255, 255, 255, 255]));
-        let host = Link::host(white, "Host".into(), [1, 2, 3], ctx.clone()).unwrap();
+        let host = Link::host(white, "Host".into(), [1, 2, 3], false, ctx.clone()).unwrap();
         let addr = format!("127.0.0.1:{}", host.hosting_at().unwrap().port());
         let chatty = Link::join(addr.clone(), "Chatty".into(), [4, 5, 6], None, ctx.clone()).unwrap();
         let quiet = Link::join(addr, "Quiet".into(), [7, 8, 9], None, ctx).unwrap();
@@ -503,11 +495,70 @@ mod tests {
         }
     }
 
+    /// Wait for the next message on `link` that `want` picks out, skipping others.
+    fn wait_for<T>(link: &Link, mut want: impl FnMut(FromHub) -> Option<T>) -> T {
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until {
+            match link.try_recv() {
+                Some(LinkEvent::Message(m)) => {
+                    if let Some(t) = want(m) {
+                        return t;
+                    }
+                }
+                Some(LinkEvent::Closed(why)) => panic!("closed: {why}"),
+                None => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        panic!("it never arrived");
+    }
+
+    #[test]
+    fn a_friend_waits_at_the_door_until_let_in_and_hangs_up_when_kicked() {
+        let ctx = Context::default();
+        let white = RgbaImage::from_pixel(32, 32, image::Rgba([255, 255, 255, 255]));
+        let host = Link::host(white, "Host".into(), [1, 2, 3], true, ctx.clone()).unwrap();
+        let addr = format!("127.0.0.1:{}", host.hosting_at().unwrap().port());
+        let friend = Link::join(addr, "Friend".into(), [4, 5, 6], None, ctx).unwrap();
+        let host_id = wait_for(&host, |m| if let FromHub::Welcome { you, .. } = m { Some(you) } else { None });
+        assert_eq!(wait_for(&friend, |m| if let FromHub::Asking(h) = m { Some(h) } else { None }), "Host");
+        let waiting = wait_for(&host, |m| if let FromHub::Waiting(w) = m { Some(w) } else { None });
+        assert_eq!(waiting.len(), 1);
+        let friend_id = waiting[0].id;
+
+        // Waiting for longer than a quiet connection lasts, hearing nothing of the drawing.
+        let patch = Patch::build(IRect::new(1, 1, 3, 3), |_, _| Some([9, 9, 9, 255])).unwrap();
+        host.send(ToHub::Edit { id: 1, edit: Edit::Patch(patch) });
+        let until = Instant::now() + GIVE_UP_AFTER * 2;
+        while Instant::now() < until {
+            match friend.try_recv() {
+                Some(LinkEvent::Closed(why)) => panic!("dropped while waiting: {why}"),
+                Some(LinkEvent::Message(m)) => panic!("heard {m:?} before being let in"),
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+
+        host.send(ToHub::LetIn { kid: friend_id, yes: true });
+        let seq = wait_for(&friend, |m| if let FromHub::Welcome { seq, .. } = m { Some(seq) } else { None });
+        assert_eq!(seq, 1, "the picture so far comes with the welcome");
+
+        host.send(ToHub::Kick(friend_id));
+        let by = wait_for(&friend, |m| if let FromHub::KickedOut { by, .. } = m { Some(by) } else { None });
+        assert_eq!(by, host_id);
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until {
+            if let Some(LinkEvent::Closed(_)) = friend.try_recv() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the kicked friend's connection stayed open");
+    }
+
     #[test]
     fn host_and_friend_over_real_sockets() {
         let ctx = Context::default();
         let white = RgbaImage::from_pixel(64, 48, image::Rgba([255, 255, 255, 255]));
-        let host = Link::host(white, "Host".into(), [1, 2, 3], ctx.clone()).unwrap();
+        let host = Link::host(white, "Host".into(), [1, 2, 3], false, ctx.clone()).unwrap();
         let addr = host.hosting_at().unwrap();
         let friend = Link::join(format!("127.0.0.1:{}", addr.port()), "Friend".into(), [4, 5, 6], None, ctx).unwrap();
 

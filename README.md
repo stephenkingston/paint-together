@@ -37,7 +37,7 @@ cargo install paint-together     # then run: paint
 
 Everything happens on the **Together** tab.
 
-1. One kid presses **Start drawing**. Their picture becomes the shared one.
+1. One kid presses **Start drawing**. Their picture becomes the shared one. With **Let friends in without asking** on (the default), friends come straight in. Turn it off, and the host gets a small notice for each friend who wants to join, with a green tick to let them in and a red cross to say no.
 2. Friends on the same Wi-Fi press **Join a drawing** and tap it in the list, or click *Join Maya's drawing* in the status bar. If it doesn't show up, type the address shown on the host's Together tab, such as `192.168.1.20`.
 3. Everyone draws at once.
 
@@ -50,11 +50,12 @@ What you get:
 - **Anyone can change the whole picture** (New, Open, Rotate, Crop, Resize…). New and Open ask first, because they replace the picture on everyone's screen.
 - **If the host leaves, the drawing carries on.** The next kid's Paint takes over as host, and everyone reconnects to it automatically, keeping their undo history and any edits still on their way.
 - **Who's here.** The Friends list shows up to nine names, and a button opens the full list for a big room. The status bar says how many friends are drawing, and a short notice says who joined or left. When a crowd arrives, it's one notice, such as "12 friends joined".
+- **The host keeps order.** Hovering a friend's name shows a cross that kicks them out, and everyone sees a notice such as "Blue Fox has been kicked out by Maya". The kicked-out kid keeps the picture, and has to ask to come back, even when friends are let in without asking.
 - **Fun names** ("Mighty Hedgehog") and colours, which you can change on the Together tab.
 
 From the command line, `paint --join 192.168.1.20` opens Paint and joins that drawing straight away.
 
-**Network:** drawing together uses TCP port **47100** (or another free port) for the drawing, and mDNS (UDP port **5353**) to find drawings nearby. Both stay on the local network. If a firewall blocks them, friends can't find or join the drawing; with `ufw`, for example, run `sudo ufw allow 47100/tcp` and `sudo ufw allow 5353/udp`. There is no join code: anyone on the same network can join a drawing they can see.
+**Network:** drawing together uses TCP port **47100** (or another free port) for the drawing, and mDNS (UDP port **5353**) to find drawings nearby. Both stay on the local network. If a firewall blocks them, friends can't find or join the drawing; with `ufw`, for example, run `sudo ufw allow 47100/tcp` and `sudo ufw allow 5353/udp`. There is no join code: anyone on the same network can join a drawing they can see, unless the host lets friends in one by one.
 
 ---
 
@@ -134,9 +135,9 @@ Each release also has builds for Windows and macOS; its notes say how to open th
 - **Shapes stay live after drawing.** You can:
   - drag inside the box to move the shape;
   - drag any of its eight handles to resize it (it's redrawn, not stretched, so it stays sharp);
-  - change colors, size, outline, fill, or even the shape type from the ribbon, and the shape updates in place.
+  - change colors, size, outline or fill from the ribbon, and the shape updates in place.
 
-  Click away or switch tools to stamp the shape onto the picture.
+  Click away, pick another shape or switch tools to stamp the shape onto the picture.
 - **Shift** keeps shapes in proportion (squares, circles) and snaps lines to 45°.
 
 ### Text
@@ -253,6 +254,7 @@ Paint is a single egui application. Some details worth knowing:
   - **Rebasing.** When a friend's edit arrives, it goes into the base, and anything in progress (a stroke, live shape, text box or floating selection) is redrawn on top from its snapshot. That is the same order the hub gives everyone, so all screens end up identical.
   - **Previews and undo.** Live previews are the 64×64 tiles where the screen differs from the base, sent up to 30 times a second. Undo sends a patch that restores my pixels only where the picture still shows them.
   - **Finding and handing over.** mDNS finds drawings nearby, and heartbeats notice a vanished computer within seconds. Every guest keeps a port ready, so the earliest-joined kid can take over as host.
+  - **The door.** Friends waiting to be let in hear nothing of the drawing until the host says yes. A new host carries on the room's choice, and lets everyone who was already in straight back in.
 
 ---
 
@@ -275,7 +277,7 @@ Paint is a single egui application. Some details worth knowing:
 | `src/logo.rs` | The app icon, rendered in code |
 | `src/collab/mod.rs` | Drawing together: the confirmed / base / screen pictures, previews, friends' pointers |
 | `src/collab/patch.rs` | Masked pixel patches, and undoing only your own pixels |
-| `src/collab/hub.rs` | The host's coordinator: puts edits in order and keeps the true picture |
+| `src/collab/hub.rs` | The host's coordinator: puts edits in order, keeps the true picture, and keeps the door (letting friends in, kicking out) |
 | `src/collab/net.rs` | Framing, compression, the hub thread, connections and heartbeats |
 | `src/collab/protocol.rs` | The messages apps send each other |
 | `src/collab/discovery.rs` | Finding drawings nearby with mDNS |
@@ -293,11 +295,11 @@ Paint is a single egui application. Some details worth knowing:
 cargo test
 ```
 
-The suite of 57 tests covers:
+The suite of 65 tests covers:
 - **Pixel engine:** polygon coverage, anti-aliased capsules, flood fill boundaries, tolerance, and fills that reach anti-aliased edges without leaking.
 - **Undo history.**
 - **Shapes and brushes:** the geometry of every shape, and every brush.
-- **Tools, driven as the mouse drives them:** strokes with either mouse button, the eraser, shape outline and fill, live shapes (moving, resizing, restyling, deleting), selections (moving, free-form delete, transparent selection, rotating a selection), and pasting an image larger than the canvas.
+- **Tools, driven as the mouse drives them:** strokes with either mouse button, the eraser, shape outline and fill, live shapes (moving, resizing, restyling, deleting, stamping when another shape is picked), selections (moving, free-form delete, transparent selection, rotating a selection), and pasting an image larger than the canvas.
 - **Text:** rendering, and on-canvas typing using real keyboard events (caret movement, word selection, undo, input-method text, paste, click-to-place-caret).
 - **Zoom** stays centered on the pointer. **Gridlines** are spaced for every zoom level. Pencil, Fill, Brushes and Color picker use their own pointer, and the Eraser shows only its square.
 - **Drawing together:**
@@ -309,9 +311,11 @@ The suite of 57 tests covers:
     - undo leaving friends' pixels alone;
     - previews, pointers and friends' tools;
     - join and leave notices (a crowd arriving is one notice);
+    - the host kicking a friend out, and friends waiting until the host lets them in (or doesn't);
     - friends' drawings in progress merged into the picture on screen.
   - **Random sessions.** Randomized sessions of strokes, fills, shapes, text, moved selections, undo, redo and whole-picture changes, with messages arriving in random orders. Every screen must end up identical, byte for byte, with no friend's unfinished drawing left behind.
-  - **Real sockets.** Message framing and size limits, a host and a friend talking over real sockets, a quiet friend staying connected while another chats, and a host leaving while the next kid takes over.
+  - **The door.** Kicked-out kids have to ask to come back, only the host decides, and after a takeover everyone who was in comes straight back.
+  - **Real sockets.** Message framing and size limits, a host and a friend talking over real sockets, a quiet friend staying connected while another chats, a friend waiting at the door (hearing nothing of the drawing) until let in and cut off when kicked out, and a host leaving while the next kid takes over.
 
 One more test is run by hand across two computers: start a drawing on one, then on the other run `PAINT_JOIN=<address> cargo test joins_a_real_room -- --ignored --nocapture`.
 

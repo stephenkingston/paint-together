@@ -12,9 +12,10 @@ use image::{DynamicImage, Rgba, RgbaImage, imageops};
 
 use crate::brush::{self, BrushKind};
 use crate::collab::discovery::Discovery;
+use crate::collab::hub::Hub;
 use crate::collab::net::{self, Link, LinkEvent};
 use crate::collab::patch::{self as collab_patch, Edit, Patch, Region};
-use crate::collab::protocol::{FromHub, Held, Kid, Presence, ToHub};
+use crate::collab::protocol::{FromHub, Held, Kid, PeerId, Presence, ToHub};
 use crate::collab::{Received, Session, names};
 use crate::history::{Change, History};
 use crate::icons::{self, FileKind, Icon};
@@ -280,6 +281,10 @@ pub struct PaintApp {
     /// My name and colour when drawing together.
     me_name: String,
     me_color: [u8; 3],
+    /// Drawings I start: friends wait for me to let them in (else they come straight in).
+    ask_first: bool,
+    /// Joining a drawing whose host lets friends in: the host's name, while I wait.
+    asking: Option<String>,
     /// The Join dialog, with the address typed so far.
     join_dialog: Option<String>,
     /// New/Open while drawing together: asks first, since it changes everyone's picture.
@@ -378,10 +383,10 @@ impl PaintApp {
         let mut app = Self::with_context(cc.egui_ctx.clone(), initial);
         app.lan_discovery = true;
         match load_me() {
-            Some((name, color)) => (app.me_name, app.me_color) = (name, color),
+            Some((name, color, ask_first)) => (app.me_name, app.me_color, app.ask_first) = (name, color, ask_first),
             None => {
                 (app.me_name, app.me_color) = names::random();
-                save_me(&app.me_name, app.me_color);
+                app.save_me();
             }
         }
         if let Some(addr) = join {
@@ -413,6 +418,8 @@ impl PaintApp {
             invite: None,
             me_name: String::new(),
             me_color: names::COLORS[0],
+            ask_first: false,
+            asking: None,
             join_dialog: None,
             confirm_everyone: None,
             preview_dirty: IRect::EMPTY,
@@ -790,13 +797,15 @@ impl PaintApp {
 
     /// Handle one message from the room's hub.
     fn net_receive(&mut self, msg: FromHub) {
-        if let FromHub::Welcome { you, host, seq, picture, kids } = msg {
+        if let FromHub::Welcome { you, host, seq, picture, kids, ask_first } = msg {
             let Some(img) = picture.to_image() else {
                 return;
             };
+            self.asking = None;
             if self.handover.take().is_some() {
                 if let Some(s) = &mut self.session {
                     s.rejoin(you, host, seq, img, kids);
+                    s.ask_first = ask_first;
                     self.img = s.base.clone();
                     self.tex_full = true;
                     let news = match s.kids.iter().find(|k| k.id == host) {
@@ -813,13 +822,40 @@ impl PaintApp {
             self.sel = None;
             self.history.clear();
             self.replace_marks.clear();
-            self.session = Some(Session::new(you, host, seq, img.clone(), kids));
+            let mut session = Session::new(you, host, seq, img.clone(), kids);
+            session.ask_first = ask_first;
+            self.session = Some(session);
             self.saved_version = 0;
             self.img = img;
             self.tex_full = true;
             self.fit_pending = true;
             self.pending_scroll = Some(Vec2::ZERO);
             return;
+        }
+        match msg {
+            FromHub::Asking(host) => return self.asking = Some(host),
+            // Not let in (or taking over as host didn't work out: try the next kid).
+            FromHub::Rejected(_) if self.handover.is_some() => return self.lost_host(),
+            FromHub::Rejected(why) => {
+                self.leave_together();
+                return self.error = Some(why);
+            }
+            _ => {}
+        }
+        let Some(s) = &self.session else { return };
+        let mut before = s.kids.clone();
+        if let FromHub::KickedOut { kid, by, .. } = &msg {
+            let name = |id: PeerId| before.iter().find(|k| k.id == id).map_or_else(|| "A friend".to_owned(), |k| k.name.clone());
+            if *kid == s.me {
+                let host = name(*by);
+                self.leave_together();
+                self.error = Some(format!("You have been kicked out by {host}.\n\nThe picture stays with you."));
+                return;
+            }
+            let by = if *by == s.me { "you".to_owned() } else { name(*by) };
+            self.toast(format!("{} has been kicked out by {by}", name(*kid)));
+            // Not "… left" as well.
+            before.retain(|k| k.id != *kid);
         }
         let Some(s) = &self.session else { return };
         // Whole-picture changes (and anything arriving while my canvas is a
@@ -829,7 +865,6 @@ impl PaintApp {
             self.settle();
         }
         let Some(s) = &mut self.session else { return };
-        let before = s.kids.clone();
         match s.receive(msg) {
             Received::Picture(region) => self.rebase(region),
             Received::Kids => {
@@ -840,10 +875,98 @@ impl PaintApp {
         }
     }
 
+    fn save_me(&self) {
+        save_me(&self.me_name, self.me_color, self.ask_first);
+    }
+
+    /// Whether this app runs the room.
+    fn hosting(&self) -> bool {
+        self.handover.is_none() && self.session.as_ref().is_some_and(|s| s.host == s.me)
+    }
+
+    /// Whether friends wait for me to let them in: for drawings I start, and the
+    /// one I'm hosting.
+    fn set_ask_first(&mut self, on: bool) {
+        self.ask_first = on;
+        self.save_me();
+        if self.hosting()
+            && let Some(s) = &mut self.session
+        {
+            s.ask_first = on;
+            s.send(ToHub::AskFirst(on));
+        }
+    }
+
+    /// Send a friend out of the drawing I'm hosting.
+    fn kick(&mut self, kid: PeerId) {
+        if self.hosting()
+            && let Some(s) = &mut self.session
+        {
+            s.send(ToHub::Kick(kid));
+        }
+    }
+
+    /// Answer friends waiting to be let in.
+    fn let_in(&mut self, kids: &[PeerId], yes: bool) {
+        let Some(s) = &mut self.session else { return };
+        for &kid in kids {
+            s.send(ToHub::LetIn { kid, yes });
+        }
+        s.waiting.retain(|k| !kids.contains(&k.id));
+    }
+
+    /// Friends waiting to be let in, for the host to answer, or my own wait to be
+    /// let in: notices at the bottom of the picture. Returns how much room they take.
+    fn door_notices(&mut self, ctx: &Context) -> f32 {
+        let waiting = self.session.as_ref().filter(|_| self.hosting()).map(|s| s.waiting.clone()).unwrap_or_default();
+        let start = self.view_rect.center_bottom() - vec2(0.0, 18.0);
+        let mut bottom = start;
+        let mut pill = |id: Id, add: &mut dyn FnMut(&mut Ui)| {
+            let shown = egui::Area::new(id).order(egui::Order::Foreground).pivot(Align2::CENTER_BOTTOM).fixed_pos(bottom).show(ctx, add);
+            bottom.y -= shown.response.rect.height() + 6.0;
+        };
+        if let Some(host) = self.asking.clone() {
+            let mut stop = false;
+            pill(Id::new("asking"), &mut |ui| {
+                stop = door_pill(ui, None, &format!("Waiting for {host} to let you in…"), None, "Stop waiting").is_some();
+            });
+            if stop {
+                self.leave_together();
+            }
+        }
+        // A few at a time; a crowd at the door gets one more notice for the rest.
+        const SHOWN: usize = 3;
+        let mut answers: Vec<(Vec<PeerId>, bool)> = Vec::new();
+        for kid in waiting.iter().take(SHOWN) {
+            pill(Id::new(("waiting", kid.id)), &mut |ui| {
+                let (who, text) = (Some((kid.name.as_str(), kid.color)), format!("{} wants to join", kid.name));
+                if let Some(yes) = door_pill(ui, who, &text, Some(&format!("Let {} in", kid.name)), "Not this time") {
+                    answers.push((vec![kid.id], yes));
+                }
+            });
+        }
+        if waiting.len() > SHOWN {
+            let rest: Vec<PeerId> = waiting[SHOWN..].iter().map(|k| k.id).collect();
+            pill(Id::new("waiting-more"), &mut |ui| {
+                let text = match rest.len() {
+                    1 => "1 more wants to join".to_owned(),
+                    n => format!("{n} more want to join"),
+                };
+                if let Some(yes) = door_pill(ui, None, &text, Some("Let them all in"), "Not this time") {
+                    answers.push((rest.clone(), yes));
+                }
+            });
+        }
+        for (kids, yes) in answers {
+            self.let_in(&kids, yes);
+        }
+        start.y - bottom.y
+    }
+
     /// Start a drawing that friends on the network can join.
     fn start_together(&mut self) {
         self.settle();
-        match Link::host(self.img.clone(), self.me_name.clone(), self.me_color, self.ctx.clone()) {
+        match Link::host(self.img.clone(), self.me_name.clone(), self.me_color, self.ask_first, self.ctx.clone()) {
             Ok(link) => {
                 self.invite = link.hosting_at();
                 self.link = Some(link);
@@ -873,6 +996,7 @@ impl PaintApp {
         self.link = None;
         self.invite = None;
         self.handover = None;
+        self.asking = None;
         if let Some(d) = &mut self.discovery {
             d.stop_advertising();
         }
@@ -930,15 +1054,15 @@ impl PaintApp {
         }
     }
 
-    /// Notices at the bottom of the picture area, fading out.
-    fn paint_toasts(&mut self, ctx: &Context) {
+    /// Notices at the bottom of the picture area (above `lift` taken by others), fading out.
+    fn paint_toasts(&mut self, ctx: &Context, lift: f32) {
         let now = ctx.input(|i| i.time);
         self.toasts.retain(|t| t.until > now);
         if self.toasts.is_empty() {
             return;
         }
         let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("toasts")));
-        let mut bottom = self.view_rect.center_bottom() - vec2(0.0, 18.0);
+        let mut bottom = self.view_rect.center_bottom() - vec2(0.0, 18.0 + lift);
         for Toast { text, until, .. } in self.toasts.iter().rev() {
             let fade = ((until - now) / 0.5).clamp(0.0, 1.0) as f32;
             let galley = painter.layout_no_wrap(text.clone(), FontId::proportional(13.0), Color32::WHITE.gamma_multiply(fade));
@@ -988,11 +1112,6 @@ impl PaintApp {
         }
         while let Some(event) = self.link.as_ref().and_then(|l| l.try_recv()) {
             match event {
-                LinkEvent::Message(FromHub::Rejected(why)) if self.handover.is_none() => {
-                    self.leave_together();
-                    self.error = Some(why);
-                }
-                LinkEvent::Message(FromHub::Rejected(_)) => self.lost_host(),
                 LinkEvent::Message(msg) => self.net_receive(msg),
                 LinkEvent::Closed(why) if self.session.is_none() => {
                     // Couldn't join in the first place.
@@ -1044,7 +1163,9 @@ impl PaintApp {
                 Some(l) => Ok(l),
                 None => net::listen(),
             };
-            match listener.and_then(|l| Link::host_with(l, s.confirmed().clone(), name, color, ctx)) {
+            // The room's rules carry on, and everyone who was in it comes straight back.
+            let hub = Hub::new(s.confirmed().clone()).with_door(s.ask_first, s.kids.clone());
+            match listener.and_then(|l| Link::host_with(l, hub, name, color, ctx)) {
                 Ok(link) => {
                     self.invite = link.hosting_at();
                     self.link = Some(link);
@@ -1080,6 +1201,7 @@ impl PaintApp {
     fn together_tab(&mut self, ui: &mut Ui) {
         self.discover();
         let pal = Palette::of(ui);
+        let hosting = self.hosting();
         ribbon::group(ui, Some("Draw together"), CONTENT_H, |ui| {
             if self.link.is_none() {
                 let start = ribbon::big_button(ui, Icon::Together, "Start\ndrawing", false, false, true);
@@ -1096,12 +1218,28 @@ impl PaintApp {
                     self.leave_together();
                 }
             }
+            // Who gets in: chosen before starting, and changeable while hosting.
+            if hosting || (self.link.is_none() && self.session.is_none()) {
+                ui.vertical(|ui| {
+                    ui.add_space(8.0);
+                    let mut let_in = !self.session.as_ref().filter(|_| hosting).map_or(self.ask_first, |s| s.ask_first);
+                    let tip = "When this is off, you're asked about each friend who wants to join, and can let them in or not";
+                    if ui.checkbox(&mut let_in, "Let friends in\nwithout asking").on_hover_text(tip).changed() {
+                        self.set_ask_first(!let_in);
+                    }
+                });
+                ui.add_space(6.0);
+            }
         });
         ribbon::group(ui, Some("Friends"), CONTENT_H, |ui| {
             let kids: Vec<Kid> = self.session.as_ref().map(|s| s.kids.clone()).unwrap_or_default();
             let me = self.session.as_ref().map(|s| s.me);
             if kids.is_empty() {
-                let hint = if self.link.is_some() { "Connecting…" } else { "Start or join a drawing\nto draw with friends." };
+                let hint = match (&self.asking, &self.link) {
+                    (Some(host), _) => format!("Waiting for {host}\nto let you in…"),
+                    (None, Some(_)) => "Connecting…".to_owned(),
+                    (None, None) => "Start or join a drawing\nto draw with friends.".to_owned(),
+                };
                 ui.add_space(6.0);
                 ui.label(RichText::new(hint).color(pal.text_weak));
                 ui.add_space(6.0);
@@ -1109,6 +1247,11 @@ impl PaintApp {
             // Three columns at most; a big room's full list opens from the "more" button.
             const SHOWN: usize = 9;
             let label = |kid: &Kid| if Some(kid.id) == me { format!("{} (you)", kid.name) } else { kid.name.clone() };
+            // The host can send anyone else out.
+            fn kick(kid: &Kid, hosting: bool, me: Option<PeerId>) -> Option<&str> {
+                (hosting && Some(kid.id) != me).then_some(kid.name.as_str())
+            }
+            let mut kicked = None;
             for (i, column) in kids[..kids.len().min(SHOWN)].chunks(3).enumerate() {
                 if i > 0 {
                     ui.add_space(16.0);
@@ -1116,7 +1259,9 @@ impl PaintApp {
                 ui.vertical(|ui| {
                     ui.add_space(2.0);
                     for kid in column {
-                        kid_row(ui, &label(kid), kid.color, pal.text);
+                        if kid_row(ui, &label(kid), kid.color, pal.text, kick(kid, hosting, me)) {
+                            kicked = Some(kid.id);
+                        }
                     }
                 });
             }
@@ -1139,13 +1284,18 @@ impl PaintApp {
                                 }
                                 ui.vertical(|ui| {
                                     for kid in column {
-                                        kid_row(ui, &label(kid), kid.color, pal.text);
+                                        if kid_row(ui, &label(kid), kid.color, pal.text, kick(kid, hosting, me)) {
+                                            kicked = Some(kid.id);
+                                        }
                                     }
                                 });
                             }
                         });
                     });
                 });
+            }
+            if let Some(kid) = kicked {
+                self.kick(kid);
             }
         });
         if let Some(addr) = self.invite {
@@ -1168,7 +1318,7 @@ impl PaintApp {
                     let resp = ui.add_enabled(editable, edit).on_hover_text("Your name, shown to friends");
                     if resp.lost_focus() {
                         self.me_name = names::tidy(&self.me_name);
-                        save_me(&self.me_name, self.me_color);
+                        self.save_me();
                     }
                 });
                 ui.add_space(3.0);
@@ -1184,7 +1334,7 @@ impl PaintApp {
                         }
                         if editable && resp.clicked() {
                             self.me_color = c;
-                            save_me(&self.me_name, self.me_color);
+                            self.save_me();
                         }
                     }
                 });
@@ -1414,6 +1564,14 @@ impl PaintApp {
         if let Some(live) = self.live_shape.take() {
             self.push_patch(live.snapshot(), live.touched());
         }
+    }
+
+    /// Choose a shape from the gallery: the shape just drawn is stamped as it
+    /// is, and the next drag draws a new one.
+    fn pick_shape(&mut self, kind: ShapeKind) {
+        self.commit_shape();
+        self.shape = kind;
+        self.set_tool(Tool::Shape);
     }
 
     fn discard_shape(&mut self) {
@@ -2874,11 +3032,7 @@ impl PaintApp {
             }
             icons::paint(Icon::Shape(kind), &painter, icons::square(cell.center(), 16.0), true);
             if resp.on_hover_text(kind.name()).clicked() {
-                self.shape = kind;
-                if let Some(live) = &mut self.live_shape {
-                    live.kind = kind;
-                }
-                self.set_tool(Tool::Shape);
+                self.pick_shape(kind);
             }
         }
         // Paint's gallery scroll strip.
@@ -2905,11 +3059,7 @@ impl PaintApp {
             egui::Popup::menu(&more).width(240.0).show(|ui| {
                 for kind in ShapeKind::ALL {
                     if ribbon::menu_item(ui, Some(Icon::Shape(kind)), kind.name(), self.tool == Tool::Shape && self.shape == kind, true).clicked() {
-                        self.shape = kind;
-                        if let Some(live) = &mut self.live_shape {
-                            live.kind = kind;
-                        }
-                        self.set_tool(Tool::Shape);
+                        self.pick_shape(kind);
                         ui.close();
                     }
                 }
@@ -3062,7 +3212,7 @@ impl PaintApp {
             }
             // Drawing together: who's here, or a drawing nearby to join (shown left
             // of the zoom controls, when there's room).
-            let invite = match (&self.session, &self.discovery) {
+            let invite = match (&self.link, &self.discovery) {
                 (None, Some(d)) => d.nearby.iter().find(|n| n.compatible).cloned(),
                 _ => None,
             };
@@ -3680,7 +3830,7 @@ impl PaintApp {
                         ui.label(RichText::new("Paint").size(22.0).color(Color32::from_rgb(0x00, 0x33, 0x99)));
                         ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                         ui.add_space(6.0);
-                        ui.label("A from-scratch reimplementation of Microsoft Paint for macOS, written in Rust.");
+                        ui.label("A from-scratch reimplementation of Microsoft Paint, written in Rust.");
                     });
                 });
                 ui.add_space(12.0);
@@ -3889,7 +4039,8 @@ impl eframe::App for PaintApp {
         self.thumbnail(&ctx);
         self.update_text_preview();
         self.dialogs(&ctx);
-        self.paint_toasts(&ctx);
+        let lift = self.door_notices(&ctx);
+        self.paint_toasts(&ctx, lift);
         self.update_title(&ctx);
         self.flush_network();
         if self.tex_full || !self.tex_dirty.is_empty() || !matches!(self.op, Op::Idle) {
@@ -4335,21 +4486,24 @@ fn me_file() -> Option<PathBuf> {
     recent_file().map(|f| f.with_file_name("me.txt"))
 }
 
-/// My name and colour for drawing together, as last chosen.
-fn load_me() -> Option<(String, [u8; 3])> {
+/// My name and colour for drawing together, and whether friends ask to join
+/// drawings I start, as last chosen.
+fn load_me() -> Option<(String, [u8; 3], bool)> {
     let text = std::fs::read_to_string(me_file()?).ok()?;
     let mut lines = text.lines();
     let name = names::tidy(lines.next()?);
     let c: Vec<u8> = lines.next()?.split(',').filter_map(|v| v.trim().parse().ok()).collect();
-    (c.len() == 3).then(|| (name, [c[0], c[1], c[2]]))
+    let ask_first = lines.next() == Some("ask first");
+    (c.len() == 3).then(|| (name, [c[0], c[1], c[2]], ask_first))
 }
 
-fn save_me(name: &str, [r, g, b]: [u8; 3]) {
+fn save_me(name: &str, [r, g, b]: [u8; 3], ask_first: bool) {
     let Some(file) = me_file() else { return };
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(file, format!("{name}\n{r},{g},{b}\n"));
+    let door = if ask_first { "ask first" } else { "let in" };
+    let _ = std::fs::write(file, format!("{name}\n{r},{g},{b}\n{door}\n"));
 }
 
 fn load_recent() -> Vec<PathBuf> {
@@ -4488,6 +4642,19 @@ mod tests {
         a.size_shape = 2.0;
         drag(a, PointerButton::Primary, &[(20.0, 20.0), (60.0, 50.0)]);
         a.render_live_shape();
+    }
+
+    #[test]
+    fn picking_another_shape_stamps_the_live_one_and_draws_anew() {
+        let mut a = app();
+        rect_shape(&mut a);
+        a.pick_shape(ShapeKind::Oval);
+        assert!(a.live_shape.is_none(), "the rectangle is stamped");
+        assert_eq!(a.history.state_id(), 1);
+        assert_eq!(px(&a, 20, 20), BLACK, "still a rectangle: its corner is drawn");
+        drag(&mut a, PointerButton::Primary, &[(100.0, 100.0), (160.0, 140.0)]);
+        assert_eq!(a.live_shape.as_ref().map(|l| l.kind), Some(ShapeKind::Oval));
+        assert_eq!(px(&a, 20, 20), BLACK, "the rectangle stays");
     }
 
     #[test]
@@ -4914,15 +5081,18 @@ mod tests {
                 room
             }
 
-            fn join(&mut self) {
+            /// A new kid arrives (each from their own computer), and comes in or
+            /// waits to be let in; returns their index.
+            fn join(&mut self) -> usize {
                 let id = self.kids.len() as PeerId + 1;
-                let out = self.hub.join(id, format!("Kid {id}"), [200, 50, 50], String::new());
+                let out = self.hub.join(id, format!("Kid {id}"), [200, 50, 50], format!("10.0.0.{id}:47100"));
                 self.kids.push((id, app()));
                 self.up.push(VecDeque::new());
                 self.down.push(VecDeque::new());
                 self.route(out);
                 let i = self.kids.len() - 1;
                 self.kid_gets(i);
+                i
             }
 
             fn route(&mut self, out: Vec<(To, FromHub)>) {
@@ -4930,8 +5100,9 @@ mod tests {
                     for (i, (id, _)) in self.kids.iter().enumerate() {
                         let wanted = match to {
                             To::One(k) => k == *id,
-                            To::All => true,
-                            To::Others(k) => k != *id,
+                            To::All => self.hub.is_in(*id),
+                            To::Others(k) => k != *id && self.hub.is_in(*id),
+                            To::Everyone => true,
                         };
                         if wanted {
                             self.down[i].push_back(msg.clone());
@@ -4993,14 +5164,15 @@ mod tests {
                 }
             }
 
-            /// Everyone finishes what they're doing; then every screen must match the hub's picture exactly.
+            /// Everyone finishes what they're doing; then every screen in the room
+            /// must match the hub's picture exactly.
             fn assert_converged(&mut self) {
                 for i in 0..self.kids.len() {
                     self.kid(i).settle();
                 }
                 self.quiesce();
                 let truth = self.hub.picture().clone();
-                for (i, (_, a)) in self.kids.iter().enumerate() {
+                for (i, (_, a)) in self.kids.iter().enumerate().filter(|(_, (id, _))| self.hub.is_in(*id)) {
                     let s = a.session.as_ref().unwrap();
                     assert_eq!(s.unconfirmed(), 0, "kid {i} still waiting on the hub");
                     assert!(s.confirmed() == &truth, "kid {i}: confirmed picture differs from the hub's");
@@ -5237,6 +5409,74 @@ mod tests {
             assert_eq!(texts, ["5 friends joined"]);
         }
 
+        fn toasts(a: &PaintApp) -> Vec<&str> {
+            a.toasts.iter().map(|t| t.text.as_str()).collect()
+        }
+
+        #[test]
+        fn the_host_can_kick_a_friend_out_and_everyone_hears_why() {
+            let mut room = Room::new(3);
+            room.quiesce();
+            for i in 0..3 {
+                room.kid(i).toasts.clear();
+            }
+            // Only the host can.
+            room.kid(1).kick(3);
+            room.quiesce();
+            assert_eq!(room.kid(2).session.as_ref().map(|s| s.kids.len()), Some(3));
+
+            line(room.kid(2), Tool::Pencil, RED, (10.0, 10.0), (60.0, 10.0));
+            room.quiesce();
+            // Still on its way when the kick lands: it stays theirs alone.
+            line(room.kid(2), Tool::Pencil, BLUE, (10.0, 20.0), (60.0, 20.0));
+            room.kid(0).kick(3);
+            room.quiesce();
+            let out = room.kid(2);
+            assert!(out.session.is_none(), "out of the room");
+            assert_eq!(out.error.as_deref(), Some("You have been kicked out by Kid 1.\n\nThe picture stays with you."));
+            assert_eq!((px(out, 30, 10), px(out, 30, 20)), (RED, BLUE), "they keep the picture");
+            assert_eq!(toasts(room.kid(1)), ["Kid 3 has been kicked out by Kid 1"]);
+            assert_eq!(toasts(room.kid(0)), ["Kid 3 has been kicked out by you"]);
+            assert_eq!(room.kid(1).session.as_ref().unwrap().kids.len(), 2);
+            room.assert_converged();
+            assert_eq!((px(room.kid(1), 30, 10), px(room.kid(1), 30, 20)), (RED, WHITE));
+        }
+
+        #[test]
+        fn when_the_host_asks_first_friends_wait_until_let_in() {
+            let mut room = Room::new(2);
+            room.kid(0).set_ask_first(true);
+            line(room.kid(0), Tool::Pencil, RED, (10.0, 10.0), (60.0, 10.0));
+            room.quiesce();
+            assert!(room.kid(1).session.as_ref().unwrap().ask_first, "everyone knows, for a new host to carry on");
+
+            let maya = room.join();
+            room.quiesce();
+            assert!(room.kid(maya).session.is_none());
+            assert_eq!(room.kid(maya).asking.as_deref(), Some("Kid 1"));
+            let waiting: Vec<PeerId> = room.kid(0).session.as_ref().unwrap().waiting.iter().map(|k| k.id).collect();
+            assert_eq!(waiting, [3]);
+            assert!(room.kid(1).session.as_ref().unwrap().waiting.is_empty(), "only the host is asked");
+            // Waiting, they see nothing of the drawing.
+            line(room.kid(1), Tool::Pencil, BLUE, (10.0, 20.0), (60.0, 20.0));
+            room.quiesce();
+            assert!(room.down[maya].is_empty());
+
+            room.kid(0).let_in(&[3], true);
+            room.quiesce();
+            assert!(room.kid(maya).asking.is_none());
+            assert_eq!(px(room.kid(maya), 30, 20), BLUE);
+            assert!(room.kid(0).session.as_ref().unwrap().waiting.is_empty());
+            room.assert_converged();
+
+            let sam = room.join();
+            room.kid(0).let_in(&[4], false);
+            room.quiesce();
+            assert!(room.kid(sam).session.is_none() && room.kid(sam).asking.is_none());
+            assert_eq!(room.kid(sam).error.as_deref(), Some("Kid 1 didn't let you in this time."));
+            assert_eq!(room.kid(1).session.as_ref().unwrap().kids.len(), 3);
+        }
+
         #[test]
         fn friends_see_my_pointer_and_tool() {
             let mut room = Room::new(2);
@@ -5420,13 +5660,85 @@ fn paint_avatar(ui: &mut Ui, name: &str, [r, g, b]: [u8; 3], size: f32) {
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, initial, FontId::proportional(size * 0.6), Color32::WHITE);
 }
 
-/// One line in the Friends list.
-fn kid_row(ui: &mut Ui, name: &str, color: [u8; 3], text: Color32) {
-    ui.horizontal(|ui| {
+/// One line in the Friends list. For the host, `kick` names the friend, and a
+/// cross shows on hover to send them out; true when it's clicked.
+fn kid_row(ui: &mut Ui, name: &str, color: [u8; 3], text: Color32, kick: Option<&str>) -> bool {
+    let row = ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
         paint_avatar(ui, name, color, 16.0);
         ui.label(RichText::new(name).color(text));
+        kick.map(|who| {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::click());
+            (rect, resp.on_hover_text(format!("Kick out {who}")).on_hover_cursor(CursorIcon::PointingHand))
+        })
     });
+    let Some((rect, resp)) = row.inner else {
+        return false;
+    };
+    if ui.rect_contains_pointer(row.response.rect) {
+        let red = Color32::from_rgb(0xC4, 0x2B, 0x1C);
+        if resp.hovered() {
+            ui.painter().circle_filled(rect.center(), 7.0, red.gamma_multiply(0.15));
+        }
+        let (c, d) = (rect.center(), 3.0);
+        let stroke = Stroke::new(1.5, if resp.hovered() { red } else { text.gamma_multiply(0.6) });
+        ui.painter().line_segment([c - vec2(d, d), c + vec2(d, d)], stroke);
+        ui.painter().line_segment([c + vec2(-d, d), c + vec2(d, -d)], stroke);
+    }
+    resp.clicked()
+}
+
+/// A notice at the door, at the bottom of the picture: maybe a friend's badge,
+/// what's happening, then a round green tick (when there's a yes to give) and
+/// red cross. Returns the answer clicked.
+fn door_pill(ui: &mut Ui, who: Option<(&str, [u8; 3])>, text: &str, tick: Option<&str>, cross: &str) -> Option<bool> {
+    let mut answer = None;
+    let frame = egui::Frame::new()
+        .fill(Color32::from_rgba_unmultiplied(40, 40, 48, 235))
+        .corner_radius(18.0)
+        .inner_margin(egui::Margin { left: if who.is_some() { 8 } else { 16 }, right: 6, top: 6, bottom: 6 });
+    frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if let Some((name, color)) = who {
+                paint_avatar(ui, name, color, 22.0);
+            }
+            let label = egui::Label::new(RichText::new(text).size(13.0).color(Color32::WHITE)).selectable(false).extend();
+            ui.add(label);
+            ui.add_space(2.0);
+            ui.spacing_mut().item_spacing.x = 5.0;
+            if let Some(tip) = tick
+                && answer_button(ui, true, tip).clicked()
+            {
+                answer = Some(true);
+            }
+            if answer_button(ui, false, cross).clicked() {
+                answer = Some(false);
+            }
+        });
+    });
+    answer
+}
+
+/// A round tick (green) or cross (red) button.
+fn answer_button(ui: &mut Ui, yes: bool, tip: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    let resp = resp.on_hover_text(tip).on_hover_cursor(CursorIcon::PointingHand);
+    let (base, lit) = if yes {
+        (Color32::from_rgb(0x2E, 0x9E, 0x44), Color32::from_rgb(0x3D, 0xB8, 0x56))
+    } else {
+        (Color32::from_rgb(0xD2, 0x3A, 0x32), Color32::from_rgb(0xE8, 0x4E, 0x45))
+    };
+    let (painter, c) = (ui.painter(), rect.center());
+    painter.circle_filled(c, 12.0, if resp.hovered() { lit } else { base });
+    let stroke = Stroke::new(2.2, Color32::WHITE);
+    if yes {
+        painter.add(egui::Shape::line(vec![c + vec2(-5.0, 0.5), c + vec2(-1.5, 4.0), c + vec2(5.0, -3.5)], stroke));
+    } else {
+        painter.line_segment([c - vec2(4.0, 4.0), c + vec2(4.0, 4.0)], stroke);
+        painter.line_segment([c + vec2(-4.0, 4.0), c + vec2(4.0, -4.0)], stroke);
+    }
+    resp
 }
 
 /// A drawing in the Join dialog's list: the host's badge, name and how many are drawing.

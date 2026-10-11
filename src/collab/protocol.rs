@@ -6,7 +6,7 @@ use crate::raster::IRect;
 pub type PeerId = u32;
 
 /// Bumped whenever the messages change; apps only talk to the same version.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// The first thing a kid's app sends after connecting.
 #[derive(Clone, Debug, PartialEq, bincode::Encode, bincode::Decode)]
@@ -86,6 +86,12 @@ pub enum ToHub {
     Presence(Presence),
     /// Still here (sent when there's nothing else to say).
     Ping,
+    /// From the host: send this kid out of the room.
+    Kick(PeerId),
+    /// From the host: let a kid who's waiting in, or not.
+    LetIn { kid: PeerId, yes: bool },
+    /// From the host: whether newcomers wait to be let in.
+    AskFirst(bool),
 }
 
 /// From the hub to the kids' apps.
@@ -99,6 +105,8 @@ pub enum FromHub {
         seq: u64,
         picture: Picture,
         kids: Vec<Kid>,
+        /// Whether newcomers wait for the host to let them in.
+        ask_first: bool,
     },
     /// An edit in its final place in the order everyone applies them in
     /// (sent to its author too, as confirmation).
@@ -110,7 +118,15 @@ pub enum FromHub {
     },
     /// Who's in the room now.
     Kids(Vec<Kid>),
-    /// Not let in (a different version of Paint, say).
+    /// The host `by` sent `kid` out of the room; `kids` is who's still in it.
+    KickedOut { kid: PeerId, by: PeerId, kids: Vec<Kid> },
+    /// You're waiting for the host (named here) to let you in.
+    Asking(String),
+    /// To the host: the kids waiting to be let in, earliest first.
+    Waiting(Vec<Kid>),
+    /// The host changed whether newcomers wait to be let in.
+    AskFirst(bool),
+    /// Not let in (a different version of Paint, or the host said no).
     Rejected(String),
     /// What a friend is drawing right now; their finished edit replaces it.
     Preview {
@@ -131,7 +147,7 @@ impl ToHub {
             ToHub::Edit { edit, .. } => edit.is_valid(),
             ToHub::Preview(tiles) => tiles_valid(tiles),
             ToHub::Presence(p) => p.is_valid(),
-            ToHub::Ping => true,
+            ToHub::Ping | ToHub::Kick(_) | ToHub::LetIn { .. } | ToHub::AskFirst(_) => true,
         }
     }
 }
@@ -143,7 +159,13 @@ impl FromHub {
             FromHub::Sequenced { edit, .. } => edit.is_valid(),
             FromHub::Preview { tiles, .. } => tiles_valid(tiles),
             FromHub::Presence { presence, .. } => presence.is_valid(),
-            FromHub::Kids(_) | FromHub::Rejected(_) | FromHub::Ping => true,
+            FromHub::Kids(_)
+            | FromHub::KickedOut { .. }
+            | FromHub::Asking(_)
+            | FromHub::Waiting(_)
+            | FromHub::AskFirst(_)
+            | FromHub::Rejected(_)
+            | FromHub::Ping => true,
         }
     }
 }

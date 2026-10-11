@@ -39,6 +39,10 @@ pub struct Session {
     /// The kid whose app runs the room.
     pub host: PeerId,
     pub kids: Vec<Kid>,
+    /// Whether newcomers wait for the host to let them in.
+    pub ask_first: bool,
+    /// When hosting: kids waiting to be let in.
+    pub waiting: Vec<Kid>,
     confirmed: RgbaImage,
     seq: u64,
     /// `confirmed` plus my unconfirmed edits.
@@ -73,6 +77,8 @@ impl Session {
             me,
             host,
             kids,
+            ask_first: false,
+            waiting: Vec::new(),
             base: picture.clone(),
             confirmed: picture,
             seq,
@@ -110,6 +116,7 @@ impl Session {
     /// unconfirmed edits on top and sent again (my undo history stays valid).
     pub fn rejoin(&mut self, me: PeerId, host: PeerId, seq: u64, picture: RgbaImage, kids: Vec<Kid>) {
         (self.me, self.host, self.seq, self.kids) = (me, host, seq, kids);
+        self.waiting.clear();
         self.confirmed = picture;
         self.base = self.confirmed.clone();
         for (_, edit) in &self.pending {
@@ -222,6 +229,11 @@ impl Session {
         std::mem::take(&mut self.outbox)
     }
 
+    /// Queue a message for the hub, in order with my edits.
+    pub fn send(&mut self, msg: ToHub) {
+        self.outbox.push(msg);
+    }
+
     /// Whether this message replaces the whole picture under someone else's
     /// hands; the app first finishes whatever it's doing.
     pub fn replaces_picture(&self, msg: &FromHub) -> bool {
@@ -230,8 +242,8 @@ impl Session {
 
     pub fn receive(&mut self, msg: FromHub) -> Received {
         match msg {
-            FromHub::Welcome { .. } | FromHub::Rejected(_) | FromHub::Ping => Received::Nothing,
-            FromHub::Kids(kids) => {
+            FromHub::Welcome { .. } | FromHub::Asking(_) | FromHub::Rejected(_) | FromHub::Ping => Received::Nothing,
+            FromHub::Kids(kids) | FromHub::KickedOut { kids, .. } => {
                 self.kids = kids;
                 let gone: Vec<PeerId> = self.previews.keys().filter(|id| !self.kids.iter().any(|k| k.id == **id)).copied().collect();
                 for id in gone {
@@ -239,6 +251,14 @@ impl Session {
                 }
                 self.pointers.retain(|id, _| self.kids.iter().any(|k| k.id == *id));
                 Received::Kids
+            }
+            FromHub::Waiting(kids) => {
+                self.waiting = kids;
+                Received::Nothing
+            }
+            FromHub::AskFirst(on) => {
+                self.ask_first = on;
+                Received::Nothing
             }
             FromHub::Preview { from, tiles } => {
                 let theirs = self.previews.entry(from).or_default();
