@@ -6,6 +6,7 @@
 mod app;
 mod brush;
 mod collab;
+mod crash;
 mod history;
 mod icons;
 mod live_shape;
@@ -41,7 +42,8 @@ fn main() -> eframe::Result {
         (first.map(std::path::PathBuf::from), None)
     };
     let icon = logo::render(256);
-    let options = eframe::NativeOptions {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Untitled - Paint")
             .with_app_id("paint")
@@ -55,5 +57,28 @@ fn main() -> eframe::Result {
             .with_icon(egui::IconData { width: icon.width(), height: icon.height(), rgba: icon.into_raw() }),
         ..Default::default()
     };
-    eframe::run_native("Paint", options, Box::new(move |cc| Ok(Box::new(app::PaintApp::new(cc, initial, join)))))
+    // Draw with Direct3D 12 on Windows: it's always there (in software at worst), while
+    // some Vulkan and OpenGL drivers leave the window black or fail to start at all.
+    // WGPU_BACKEND=vulkan (or gl) still picks another, should a computer need it.
+    #[cfg(windows)]
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        use eframe::wgpu::Backends;
+        setup.instance_descriptor.backends = Backends::from_env().unwrap_or(Backends::DX12);
+    }
+    crash::watch();
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_native("Paint", options, Box::new(move |cc| Ok(Box::new(app::PaintApp::new(cc, initial, join)))))
+    }));
+    match run {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            crash::save(&format!("Couldn't open the window: {e}\n\n{e:?}"));
+            crash::tell(&format!("Paint couldn't open its window.\n\n{e}"));
+            Err(e)
+        }
+        Err(_) => {
+            crash::tell("Sorry! Paint ran into a problem and had to close.");
+            std::process::exit(101);
+        }
+    }
 }

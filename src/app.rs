@@ -380,6 +380,10 @@ pub struct PaintApp {
 
 impl PaintApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>, join: Option<String>) -> Self {
+        if let Some(render) = &cc.wgpu_render_state {
+            let a = render.adapter.get_info();
+            crate::crash::note_graphics(format!("{} ({:?}, {:?}, driver {} {})", a.name, a.backend, a.device_type, a.driver, a.driver_info));
+        }
         let mut app = Self::with_context(cc.egui_ctx.clone(), initial);
         app.lan_discovery = true;
         match load_me() {
@@ -4469,21 +4473,25 @@ fn local_utc_offset(_secs: i64) -> i64 {
     0
 }
 
-fn recent_file() -> Option<PathBuf> {
+/// Where Paint keeps what it remembers between runs (and its last crash report).
+pub fn settings_dir() -> Option<PathBuf> {
     if cfg!(windows) {
-        return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Paint (Rust)").join("recent.txt"));
+        return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Paint (Rust)"));
     }
     let home = std::env::var_os("HOME")?;
-    let dir = if cfg!(target_os = "macos") {
+    Some(if cfg!(target_os = "macos") {
         std::path::Path::new(&home).join("Library/Application Support/Paint (Rust)")
     } else {
         std::path::Path::new(&home).join(".config/paint-rust")
-    };
-    Some(dir.join("recent.txt"))
+    })
+}
+
+fn recent_file() -> Option<PathBuf> {
+    settings_dir().map(|d| d.join("recent.txt"))
 }
 
 fn me_file() -> Option<PathBuf> {
-    recent_file().map(|f| f.with_file_name("me.txt"))
+    settings_dir().map(|d| d.join("me.txt"))
 }
 
 /// My name and colour for drawing together, and whether friends ask to join

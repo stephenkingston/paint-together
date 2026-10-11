@@ -55,7 +55,7 @@ What you get:
 
 From the command line, `paint --join 192.168.1.20` opens Paint and joins that drawing straight away.
 
-**Network:** drawing together uses TCP port **47100** (or another free port) for the drawing, and mDNS (UDP port **5353**) to find drawings nearby. Both stay on the local network. If a firewall blocks them, friends can't find or join the drawing; with `ufw`, for example, run `sudo ufw allow 47100/tcp` and `sudo ufw allow 5353/udp`. There is no join code: anyone on the same network can join a drawing they can see, unless the host lets friends in one by one.
+**Network:** drawing together uses TCP port **47100** (or another free port) for the drawing, and mDNS (UDP port **5353**) to find drawings nearby. Both stay on the local network. If a firewall blocks them, friends can't find or join the drawing; with `ufw`, for example, run `sudo ufw allow 47100/tcp` and `sudo ufw allow 5353/udp`. On Windows, the firewall asks the first time you open the Together tab: choose **Allow access**. There is no join code: anyone on the same network can join a drawing they can see, unless the host lets friends in one by one.
 
 ---
 
@@ -88,6 +88,11 @@ Each release also has builds for Windows and macOS; its notes say how to open th
 - **Wayland or X11**, with working **Vulkan or OpenGL** drivers.
 - **fontconfig**, which the Text tool uses to find fonts.
 - An **XDG desktop portal** (`xdg-desktop-portal` plus a backend such as `-gtk`, `-kde`, `-gnome` or `-hyprland`) for the Open and Save dialogs. Desktop environments include one.
+
+### If Paint won't start
+If Paint can't open its window, or runs into a problem and has to close, it says so and saves the details in `crash.txt`: in `%APPDATA%\Paint (Rust)` on Windows, `~/Library/Application Support/Paint (Rust)` on macOS and `~/.config/paint-rust` on Linux. Please attach that file when reporting the problem.
+
+On Windows, Paint draws with Direct3D 12, falling back to Windows' own software renderer when the graphics driver lacks it. To try the Vulkan or OpenGL driver instead, set the environment variable `WGPU_BACKEND` to `vulkan` or `gl`.
 
 ---
 
@@ -263,6 +268,7 @@ Paint is a single egui application. Some details worth knowing:
 | File | What's in it |
 |---|---|
 | `src/main.rs` | Entry point and window setup; `--join ADDRESS`, and `--export-icon PATH [SIZE]` (used for packaging) |
+| `src/crash.rs` | Saying so when Paint can't start or has to close, and keeping a crash report |
 | `src/app.rs` | The app: state, tools, mouse and keyboard handling, ribbon tabs, menus, dialogs, canvas view |
 | `src/ribbon.rs` | Ribbon controls: big, small and split buttons, groups, tabs, menu rows, swatches, sliders |
 | `src/icons.rs` | Vector icons and their pixel-snapping drawing helpers |
