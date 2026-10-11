@@ -402,6 +402,8 @@ impl PaintApp {
 
     fn with_context(ctx: Context, initial: Option<PathBuf>) -> Self {
         theme::install(&ctx);
+        // Ctrl/⌘ + and − zoom the picture; left on, egui would also grow the whole window's UI.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let (light, dark) = (Color32::from_gray(255), Color32::from_gray(204));
         let checker = ctx.load_texture(
             "checker",
@@ -4468,6 +4470,11 @@ fn local_utc_offset(_secs: i64) -> i64 {
 
 /// Where Paint keeps what it remembers between runs (and its last crash report).
 pub fn settings_dir() -> Option<PathBuf> {
+    // Tests keep their own: they change settings (asking friends first, for one),
+    // which must never land in the settings of whoever runs them.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join("paint-tests"));
+    }
     if cfg!(windows) {
         return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Paint (Rust)"));
     }
@@ -4909,6 +4916,17 @@ mod tests {
 
     fn typed(a: &PaintApp) -> &str {
         a.text.as_ref().map_or("", |t| t.text.as_str())
+    }
+
+    #[test]
+    fn zoom_keys_zoom_the_picture_not_the_buttons() {
+        let mut a = app();
+        type_events(&mut a, vec![key(Key::Plus, Modifiers::COMMAND)]);
+        type_events(&mut a, vec![key(Key::Plus, Modifiers::COMMAND)]);
+        assert!(a.zoom > 1.0);
+        assert_eq!(a.ctx.zoom_factor(), 1.0, "the ribbon and status bar stay their size");
+        type_events(&mut a, vec![key(Key::Minus, Modifiers::COMMAND)]);
+        assert_eq!(a.ctx.zoom_factor(), 1.0);
     }
 
     #[test]
@@ -5457,6 +5475,8 @@ mod tests {
         #[test]
         fn when_the_host_asks_first_friends_wait_until_let_in() {
             let mut room = Room::new(2);
+            // Saved, but in the tests' own settings, never those of whoever runs them.
+            assert!(settings_dir().is_some_and(|d| d.starts_with(std::env::temp_dir())));
             room.kid(0).set_ask_first(true);
             line(room.kid(0), Tool::Pencil, RED, (10.0, 10.0), (60.0, 10.0));
             room.quiesce();

@@ -1,6 +1,6 @@
 [package]
 name = "paint-together"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Classic Windows Paint, rebuilt in Rust, where kids on the same Wi-Fi draw on one picture together in real time"

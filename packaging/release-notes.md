@@ -4,10 +4,11 @@ Also on crates.io: `cargo install paint-together` installs the `paint` command.
 
 ### New in this release
 
-- **Approve who joins.** Next to **Start drawing**, untick **Let friends in without asking**, and each friend who wants to join shows up as a small notice with a green tick to let them in and a red cross to say no. It's ticked by default, so friends still come straight in.
-- **Kick out.** The host can hover a friend's name and click the cross to send them out; everyone sees "Blue Fox has been kicked out by Maya". A kicked-out kid has to ask to come back.
-- **Shapes:** picking another shape stamps the one you just drew and gets ready to draw the new one, instead of changing the shape still being edited.
-- Drawing together needs everyone on 0.3.0: this version can't join drawings with 0.2.x.
+- **Windows: more reliable start-up.** Paint now draws with Direct3D 12 (or Windows' own software renderer on graphics without it), instead of whichever graphics driver it found first, which could leave it unable to open its window without a word. If Paint still can't start, or has to close, it says so and saves the details in `crash.txt` to attach to a bug report: see [If Paint won't start](https://github.com/stephenkingston/paint-together#if-paint-wont-start).
+- **Lighter on old computers.** A smaller app (about a third smaller on macOS) and much less memory: in a Windows 10 test machine, Paint sets aside 121 MB at start instead of 295 MB, and 213 MB instead of 336 MB with a 12-megapixel photo open. Undo now keeps up to 256 MB of history instead of 1 GB.
+- **Ctrl/⌘ + and −** zoom only the picture; they no longer make the ribbon and status bar bigger or smaller too.
+- Running `cargo test` no longer changes your own Paint name and settings.
+- Draws together with 0.3.0.
 
 ### Linux (x86_64)
 

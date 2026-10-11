@@ -232,7 +232,7 @@ Pushing a version tag (`git tag v0.2.0 && git push origin v0.2.0`) runs [`.githu
 | Ctrl+Shift+I | Invert colors |
 | Ctrl+Shift+N | Clear the image |
 | Ctrl+E | Image Properties |
-| Ctrl++ / Ctrl+− | Zoom in / out |
+| Ctrl++ / Ctrl+− | Zoom the picture in / out |
 | Ctrl+1 / Ctrl+0 | Actual size / Fit to window |
 | Ctrl+R / Ctrl+G | Toggle rulers / gridlines |
 | F11 | Full screen (Esc or a click to leave) |
@@ -301,13 +301,13 @@ Paint is a single egui application. Some details worth knowing:
 cargo test
 ```
 
-The suite of 66 tests (67 on Windows) covers:
+The suite of 67 tests (68 on Windows) covers:
 - **Pixel engine:** polygon coverage, anti-aliased capsules, flood fill boundaries, tolerance, and fills that reach anti-aliased edges without leaking.
 - **Undo history.**
 - **Shapes and brushes:** the geometry of every shape, and every brush.
 - **Tools, driven as the mouse drives them:** strokes with either mouse button, the eraser, shape outline and fill, live shapes (moving, resizing, restyling, deleting, stamping when another shape is picked), selections (moving, free-form delete, transparent selection, rotating a selection), and pasting an image larger than the canvas.
 - **Text:** rendering, and on-canvas typing using real keyboard events (caret movement, word selection, undo, input-method text, paste, click-to-place-caret). On Windows, naming every installed font from a few small tables finds the same faces as reading the whole files.
-- **Zoom** stays centered on the pointer. **Gridlines** are spaced for every zoom level. Pencil, Fill, Brushes and Color picker use their own pointer, and the Eraser shows only its square.
+- **Zoom** stays centered on the pointer, and its keys zoom only the picture. **Gridlines** are spaced for every zoom level. Pencil, Fill, Brushes and Color picker use their own pointer, and the Eraser shows only its square.
 - **Drawing together:**
   - **Simulated rooms.** Several Paints share one hub, and the tests decide exactly when every message arrives. Directed tests cover:
     - a friend's stroke arriving while I'm mid-stroke;
