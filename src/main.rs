@@ -42,6 +42,7 @@ fn main() -> eframe::Result {
         (first.map(std::path::PathBuf::from), None)
     };
     let icon = logo::render(256);
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Untitled - Paint")
@@ -56,20 +57,13 @@ fn main() -> eframe::Result {
             .with_icon(egui::IconData { width: icon.width(), height: icon.height(), rgba: icon.into_raw() }),
         ..Default::default()
     };
+    // Draw with Direct3D 12 on Windows: it's always there (in software at worst), while
+    // some Vulkan and OpenGL drivers leave the window black or fail to start at all.
+    // WGPU_BACKEND=vulkan (or gl) still picks another, should a computer need it.
+    #[cfg(windows)]
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
-        use eframe::wgpu;
-        // Graphics memory in small blocks: by default 128-256 MB is set aside up front, which with
-        // built-in graphics or drawing in software (most old computers) is taken from the RAM.
-        let device = setup.device_descriptor.clone();
-        setup.device_descriptor =
-            std::sync::Arc::new(move |adapter| wgpu::DeviceDescriptor { memory_hints: wgpu::MemoryHints::MemoryUsage, ..device(adapter) });
-        // Draw with Direct3D 12 on Windows: it's always there (in software at worst), while
-        // some Vulkan and OpenGL drivers leave the window black or fail to start at all.
-        // WGPU_BACKEND=vulkan (or gl) still picks another, should a computer need it.
-        #[cfg(windows)]
-        {
-            setup.instance_descriptor.backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12);
-        }
+        use eframe::wgpu::Backends;
+        setup.instance_descriptor.backends = Backends::from_env().unwrap_or(Backends::DX12);
     }
     crash::watch();
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
