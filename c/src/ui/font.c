@@ -7,10 +7,12 @@
  * character none of the four UI faces has comes from a fallback face, also
  * read on first need.
  *
- * Glyphs are rendered unhinted, like egui's, and kept in one fixed table
- * shared by every size: a slot is replaced when another glyph hashes to it,
- * so the cache never grows. Coverage is darkened with 2c - c^2 (what egui
- * does for dark text on light backgrounds) so small text isn't thin and grey.
+ * Glyphs are placed to a quarter pixel (so letters keep even spacing), with
+ * each face's x-height snapped to a whole pixel (so lowercase tops are crisp),
+ * and kept in one fixed table shared by every size and placement: a slot is
+ * replaced when another glyph hashes to it, so the cache never grows.
+ * Coverage gets a mild boost (c^(1/1.2)) so small text isn't thin and grey;
+ * a stronger one (egui's 2c - c^2) made the edges look blocky.
  */
 #include <math.h>
 #include <stdlib.h>
@@ -35,6 +37,7 @@ typedef struct
     int state;          /* 0 not read yet, 1 ready, -1 unusable */
     unsigned char *data;
     stbtt_fontinfo info;
+    float xh;           /* x-height in font units (the top of 'x'), 0 if unknown */
 } face;
 
 struct font
@@ -52,6 +55,7 @@ typedef struct
     uint32_t code;
     int16_t x0, y0, w, h;
     int8_t face;
+    uint8_t phase;      /* drawn this many quarter pixels right of a whole pixel */
     int gi;
     float advance;
     uint8_t *bitmap;    /* rendered on first draw */
@@ -292,14 +296,37 @@ static int load(int which)
         fc->data = NULL;
         return 0;
     }
+    int x0, y0, x1, y1;
+    if (stbtt_GetCodepointBox(&fc->info, 'x', &x0, &y0, &x1, &y1))
+        fc->xh = (float)y1;
     fc->state = 1;
     return 1;
+}
+
+enum
+{
+    SUBPIX = 4,         /* glyphs are placed to a quarter pixel */
+};
+
+/* Pixels per font unit at a size. The x-height is pulled onto a whole pixel when that
+ * takes no more than a small nudge of the size: the tops of a, e, n, o... then end on
+ * a pixel edge instead of smearing over two rows (light hinting; widths follow) */
+static float face_scale(const face *fc, float px)
+{
+    float s = stbtt_ScaleForMappingEmToPixels(&fc->info, px);
+    if (fc->xh > 0)
+    {
+        float target = roundf(fc->xh * s);
+        if (target >= 3 && fabsf(target / (fc->xh * s) - 1) <= 0.12f)
+            s = target / fc->xh;
+    }
+    return s;
 }
 
 int font_init(void)
 {
     for (int i = 0; i < 256; i++)
-        darken[i] = (uint8_t)((2 * 255 * i - i * i + 127) / 255);
+        darken[i] = (uint8_t)(255.0 * pow(i / 255.0, 1 / 1.2) + 0.5);
     find_faces();
     /* A missing style stands in with what there is */
     if (!faces[FONT_REGULAR].path)
@@ -332,7 +359,7 @@ font *font_get(float px, int style)
     int asc = 0, desc = 0, gap = 0;
     if (faces[main_face(style)].state > 0)
         stbtt_GetFontVMetrics(info, &asc, &desc, &gap);
-    float scale = faces[main_face(style)].state > 0 ? stbtt_ScaleForMappingEmToPixels(info, px) : 0;
+    float scale = faces[main_face(style)].state > 0 ? face_scale(&faces[main_face(style)], px) : 0;
     f->asc = asc * scale;
     f->ascent = (int)(f->asc + 0.5f);
     f->height = (int)ceilf((asc - desc + gap) * scale - 0.01f);
@@ -372,25 +399,27 @@ static int face_for(const font *f, uint32_t code, int *gi)
     return first;
 }
 
-static glyph *glyph_get(const font *f, uint32_t code)
+/* A glyph's metrics, and its bitmap at a subpixel phase (0 for measuring) */
+static glyph *glyph_get(const font *f, uint32_t code, int phase)
 {
-    uint32_t h = (code * 2654435761u) ^ (uint32_t)((uintptr_t)f >> 4) * 40503u;
+    uint32_t h = (code * 2654435761u) ^ (uint32_t)((uintptr_t)f >> 4) * 40503u ^ (uint32_t)phase * 0x9E3779B9u;
     glyph *g = &slots[(h ^ h >> 15) % SLOTS];
-    if (g->f == f && g->code == code)
+    if (g->f == f && g->code == code && g->phase == phase)
         return g;
     free(g->bitmap);
     memset(g, 0, sizeof *g);
     g->f = f;
     g->code = code;
+    g->phase = (uint8_t)phase;
     g->face = (int8_t)face_for(f, code, &g->gi);
     face *fc = &faces[g->face];
     if (fc->state <= 0)
         return g;
-    float scale = stbtt_ScaleForMappingEmToPixels(&fc->info, f->px);
+    float scale = face_scale(fc, f->px);
     int adv = 0, lsb = 0, x0, y0, x1, y1;
     stbtt_GetGlyphHMetrics(&fc->info, g->gi, &adv, &lsb);
     g->advance = adv * scale;
-    stbtt_GetGlyphBitmapBox(&fc->info, g->gi, scale, scale, &x0, &y0, &x1, &y1);
+    stbtt_GetGlyphBitmapBoxSubpixel(&fc->info, g->gi, scale, scale, (float)phase / SUBPIX, 0, &x0, &y0, &x1, &y1);
     g->x0 = (int16_t)x0;
     g->y0 = (int16_t)y0;
     g->w = (int16_t)(x1 - x0);
@@ -403,9 +432,9 @@ static void glyph_render(glyph *g)
     if (g->bitmap || g->w <= 0 || g->h <= 0)
         return;
     face *fc = &faces[g->face];
-    float scale = stbtt_ScaleForMappingEmToPixels(&fc->info, g->f->px);
+    float scale = face_scale(fc, g->f->px);
     g->bitmap = malloc((size_t)g->w * (size_t)g->h);
-    stbtt_MakeGlyphBitmap(&fc->info, g->bitmap, g->w, g->h, g->w, scale, scale, g->gi);
+    stbtt_MakeGlyphBitmapSubpixel(&fc->info, g->bitmap, g->w, g->h, g->w, scale, scale, (float)g->phase / SUBPIX, 0, g->gi);
     for (int i = 0; i < g->w * g->h; i++)
         g->bitmap[i] = darken[g->bitmap[i]];
 }
@@ -415,7 +444,7 @@ static float kern(const font *f, const glyph *a, const glyph *b)
     if (!a || a->face != b->face || faces[a->face].state <= 0)
         return 0;
     const stbtt_fontinfo *info = &faces[a->face].info;
-    return stbtt_GetGlyphKernAdvance(info, a->gi, b->gi) * stbtt_ScaleForMappingEmToPixels(info, f->px);
+    return stbtt_GetGlyphKernAdvance(info, a->gi, b->gi) * face_scale(&faces[a->face], f->px);
 }
 
 /* Next code point of UTF-8 text (a bad byte stands for itself) */
@@ -446,7 +475,7 @@ static float measure(font *f, const char *s, int len)
         uint32_t c = next_code(&s, end);
         if (c == '\n')
             continue;
-        glyph *g = glyph_get(f, c);
+        glyph *g = glyph_get(f, c, 0);
         if (have_prev)
             x += kern(f, &prev, g);
         x += g->advance;
@@ -473,19 +502,27 @@ int text_draw(surface *dst, font *f, int x, int y, const char *utf8, int len, co
         uint32_t code = next_code(&s, end);
         if (code == '\n')
             continue;
-        glyph *g = glyph_get(f, code);
+        glyph *g = glyph_get(f, code, 0);
         if (have_prev)
             pen += kern(f, &prev, g);
-        int gx = (int)floorf(pen + 0.5f) + g->x0;
-        if (g->w > 0 && gx < dst->clip.x + dst->clip.w && gx + g->w > dst->clip.x)
-        {
-            glyph_render(g);
-            if (g->bitmap)
-                gfx_mask(dst, gx, base + g->y0, g->bitmap, g->w, g->h, g->w, c);
-        }
-        pen += g->advance;
-        prev = *g;
+        prev = *g;  /* copied: fetching another phase may reuse this slot */
         have_prev = 1;
+        /* Placed to a quarter pixel, so letters keep their spacing instead of jumping to whole pixels */
+        int ix = (int)floorf(pen), phase = (int)((pen - ix) * SUBPIX + 0.5f);
+        if (phase == SUBPIX)
+        {
+            ix++;
+            phase = 0;
+        }
+        glyph *d = phase ? glyph_get(f, code, phase) : g;
+        int gx = ix + d->x0;
+        if (d->w > 0 && gx < dst->clip.x + dst->clip.w && gx + d->w > dst->clip.x)
+        {
+            glyph_render(d);
+            if (d->bitmap)
+                gfx_mask(dst, gx, base + d->y0, d->bitmap, d->w, d->h, d->w, c);
+        }
+        pen += prev.advance;
     }
     return (int)(pen + 0.5f);
 }
@@ -502,7 +539,7 @@ static int fit(font *f, const char *s, int len, float max)
     while (p < end)
     {
         const char *q = p;
-        glyph *g = glyph_get(f, next_code(&q, end));
+        glyph *g = glyph_get(f, next_code(&q, end), 0);
         x += (have_prev ? kern(f, &prev, g) : 0) + g->advance;
         if (x > max + 0.05f)
             break;

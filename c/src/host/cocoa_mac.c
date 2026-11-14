@@ -79,8 +79,12 @@ struct host_win
 {
     id window, view;
     surface surf;
-    IOSurfaceRef pixels;        /* surf.px is its memory: the window server shows it as it is */
-    int cap_w, cap_h;           /* the buffer's size: kept while the window fits in it */
+    /* The window server shows a surface where it is, while it is shown: so the app draws each
+     * frame into another one (`back`, locked, surf.px), handed to the layer whole once drawn.
+     * Drawing over the shown one let the screen catch half-drawn frames (a flickering canvas). */
+    IOSurfaceRef buf[3];
+    int nbuf, back, shown;      /* indexes into buf; back -1: none picked yet; shown -1: none */
+    int cap_w, cap_h;           /* the buffers' size: kept while the window fits in it */
     double factor;              /* device pixels per point */
     int buttons, ctrl_click, cursor, hidden, marked;
     int ime_x, ime_y, ime_h;
@@ -206,32 +210,62 @@ static IOSurfaceRef new_buffer(int w, int h)
     return buffer;
 }
 
-/* Fit the buffer to the window: a new one when it grows past it, or is a quarter of it. It stays
- * locked for the app's writes, except while handed to the layer. */
+/* Let go of every buffer (the layer keeps the one it shows until it gets another) */
+static void drop_buffers(host_win *win)
+{
+    if (win->back >= 0)
+        IOSurfaceUnlock(win->buf[win->back], 0, NULL);
+    for (int i = 0; i < win->nbuf; i++)
+        CFRelease(win->buf[i]);
+    win->nbuf = 0;
+    win->back = win->shown = -1;
+}
+
+/* The buffer the next frame is drawn into: one the screen isn't showing or still reading,
+ * made when there's none (two usually do; a third if the window server holds on to one) */
+static void pick_back(host_win *win)
+{
+    if (win->back >= 0)
+        return;
+    int pick = -1;
+    for (int i = 0; i < win->nbuf && pick < 0; i++)
+        if (i != win->shown && !IOSurfaceIsInUse(win->buf[i]))
+            pick = i;
+    if (pick < 0 && win->nbuf < 3)
+    {
+        IOSurfaceRef b = new_buffer(win->cap_w, win->cap_h);
+        if (b)
+            win->buf[pick = win->nbuf++] = b;
+    }
+    for (int i = 0; i < win->nbuf && pick < 0; i++)
+        if (i != win->shown)
+            pick = i;   /* all busy: draw anyway rather than stall */
+    if (pick < 0)
+        pick = 0;
+    win->back = pick;
+    IOSurfaceLock(win->buf[pick], 0, NULL);
+    win->surf.px = IOSurfaceGetBaseAddress(win->buf[pick]);
+    win->surf.stride = (int)(IOSurfaceGetBytesPerRow(win->buf[pick]) / 4);
+}
+
+/* Fit the buffers to the window: new ones when it grows past them, or is a quarter of them */
 static void size_buffer(host_win *win, int w, int h)
 {
     w = w > 0 ? w : 1;
     h = h > 0 ? h : 1;
     if (w > win->cap_w || h > win->cap_h || (size_t)w * (size_t)h * 4 < (size_t)win->cap_w * (size_t)win->cap_h)
     {
-        int cap_w = (w + 31) & ~31, cap_h = (h + 31) & ~31;
-        IOSurfaceRef buffer = new_buffer(cap_w, cap_h);
-        if (!buffer)
+        drop_buffers(win);
+        win->cap_w = (w + 31) & ~31;
+        win->cap_h = (h + 31) & ~31;
+        IOSurfaceRef b = new_buffer(win->cap_w, win->cap_h);
+        if (!b)
         {   /* out of memory: a tiny window is better than a crash */
-            cap_w = cap_h = w = h = 1;
-            buffer = new_buffer(1, 1);
+            win->cap_w = win->cap_h = w = h = 1;
+            b = new_buffer(1, 1);
         }
-        if (win->pixels)
-        {   /* (the layer keeps the old one while it shows it) */
-            IOSurfaceUnlock(win->pixels, 0, NULL);
-            CFRelease(win->pixels);
-        }
-        win->pixels = buffer;
-        IOSurfaceLock(buffer, 0, NULL);
-        win->surf.px = IOSurfaceGetBaseAddress(buffer);
-        win->surf.stride = (int)(IOSurfaceGetBytesPerRow(buffer) / 4);
-        win->cap_w = cap_w;
-        win->cap_h = cap_h;
+        win->buf[win->nbuf++] = b;
+        pick_back(win);
     }
     win->surf.w = w;
     win->surf.h = h;
@@ -262,24 +296,25 @@ static void backing_changed(id self, SEL cmd)
     resized(self, cmd, nil);
 }
 
-/* The view's layer shows the surface itself: the only copy of the pixels in this process. (A
- * CGImage over plain memory as the contents costs Core Animation a copy of the window's size;
- * drawing that in drawRect: costs a backing store and Metal buffers besides.) */
+/* The view's layer shows the last finished frame's surface itself, with no copy. (A CGImage over
+ * plain memory as the contents costs Core Animation a copy of the window's size; drawing that
+ * in drawRect: costs a backing store and Metal buffers besides.) */
 static void update_layer(id self, SEL cmd)
 {
     host_win *win = W;
-    if (!win || win->view != self)
+    if (!win || win->view != self || win->back < 0)
         return;
     id layer = msg(self, "layer");
     MSG(void, double)(layer, S("setContentsScale:"), win->factor);
-    IOSurfaceUnlock(win->pixels, 0, NULL);  /* written: its seed moves on, for the compositor */
-    msg1(layer, "setContents:", nil);       /* (the same surface again would look unchanged) */
-    msg1(layer, "setContents:", win->pixels);
-    IOSurfaceLock(win->pixels, 0, NULL);
+    IOSurfaceUnlock(win->buf[win->back], 0, NULL);  /* drawn: the compositor may read it now */
+    msg1(layer, "setContents:", win->buf[win->back]);
+    win->shown = win->back;
+    win->back = -1;     /* the next frame picks a buffer once it starts */
 }
 
 surface *host_surface(host_win *win)
 {
+    pick_back(win);
     return &win->surf;
 }
 
@@ -918,6 +953,7 @@ host_win *host_open(const char *title, int w, int h, void (*on_event)(void *user
     CGRect content = CGRectMake(0, 0, w / f, h / f);
     win->on_event = on_event;
     win->user = user;
+    win->back = win->shown = -1;
     /* titled, closable, miniaturizable, resizable; buffered */
     SEL init = S("initWithContentRect:styleMask:backing:defer:");
     win->window = MSG(id, CGRect, unsigned long, unsigned long, BOOL)(msg(CLS("NSWindow"), "alloc"), init, content, 15, 2, NO);
@@ -960,8 +996,7 @@ void host_close(host_win *win)
     msg(win->window, "close");
     release(win->window);
     release(win->view);
-    IOSurfaceUnlock(win->pixels, 0, NULL);
-    CFRelease(win->pixels);
+    drop_buffers(win);
     free(win);
     objc_autoreleasePoolPop(pool);
 }
