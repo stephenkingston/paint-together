@@ -4,12 +4,14 @@ A port of Paint (the Rust app in `../src`) to pure C, for **Linux, Windows and m
 
 | | Binary (stripped) | Memory, idle window |
 |---|---|---|
-| Linux x86_64 | 432 KB, needs only libc + libm | 12–13 MB RSS (Rust: 139 MB) |
-| Windows x64 | 620 KB, one .exe, system DLLs only | 26.5 MB working set (Rust 0.3.1: 78 MB) |
-| macOS arm64 | 504 KB | 35–42 MB footprint (a bare Cocoa window is 16 MB) |
+| Linux x86_64 | 399 KB, needs only libc + libm | 11.8 MB RSS (Rust: 139 MB) |
+| Windows x64 | 426 KB, one .exe, system DLLs only (Windows 7 and later; the 32-bit build runs on XP SP3) | 24.3 MB working set, 11.4 MB private (Rust 0.3.1: 78 MB) |
+| macOS arm64 | 434 KB | 34 MB footprint (a bare Cocoa window is 16 MB) |
 
 Undo steps are stored packed (runs, and the change against the picture before), so a whole-picture fill on a
-4000×3000 picture costs kilobytes instead of 96 MB, with the same results as the Rust version's undo.
+4000×3000 picture costs kilobytes instead of 96 MB, with the same results as the Rust version's undo. A stroke, a
+shape, the text box or a moved selection keeps the picture under it only in the 64×64 tiles it has drawn on (the Rust
+keeps a whole copy each), and font and picture files are mapped rather than read into memory.
 
 It draws the whole window into a software framebuffer with its own drawing code and widget kit, and a thin host per
 platform shows it: the X11 wire protocol over the socket (no Xlib, MIT-SHM; runs under XWayland on Wayland desktops),
@@ -21,12 +23,14 @@ Paint: C and Rust Paints find each other's drawings and draw together.
 
 ```sh
 make                      # Linux: build/linux/paint
-make TARGET=win64         # Windows x64 (cross, x86_64-w64-mingw32): build/win64/paint.exe
-make TARGET=win32         # Windows 32-bit (i686-w64-mingw32, XP API level)
+make TARGET=win64         # Windows x64 (cross, x86_64-w64-mingw32): build/win64/paint.exe, Windows 7 and later
+make TARGET=win32         # Windows 32-bit (i686-w64-mingw32): XP SP3 and later, no SSE needed
+make TARGET=win32 check   # the .exe imports nothing newer than XP (win64: than Windows 7)
 make TARGET=mac           # on a Mac (Apple clang): build/mac/paint; MAC_ARCH=x86_64 for Intel
 make TARGET=mac bundle    # build/mac/Paint.app
 make test                 # the tests (they draw into memory; no display needed)
 make size                 # bytes per object
+make bench                # timings of what a user feels (what decides the -O2 files in the Makefile's HOT)
 make DEBUG=1              # with symbols
 ```
 
@@ -43,7 +47,7 @@ Files named `*_linux.c`, `*_posix.c`, `*_win.c` and `*_mac.c` are built only for
 | `src/ui/` | Drawing into the framebuffer, fonts (stb_truetype), icons, the immediate-mode widget kit and ribbon |
 | `src/host/` | The platform hosts: X11 (+ XDG portal pickers over D-Bus), Win32, Cocoa, headless (tests) |
 | `src/app/` | The app: state and behaviour (`app*.c`) and what it draws (`view_*.c`) |
-| `tests/` | `test_*.c` run by `make test`; `demo_*.c` and `render_kit.c` are run by hand |
+| `tests/` | `test_*.c` run by `make test`; `demo_*.c` and `render_kit.c` are run by hand; `bench.c` by `make bench` |
 
 ## Differences from the Rust version
 

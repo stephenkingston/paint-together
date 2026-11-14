@@ -509,7 +509,7 @@ static void deflate_round_trips(void)
     }
     size_t zl = 0, ol = 0;
     uint8_t *z = zip_deflate(data, n, &zl);
-    CHECK(z && zl < n, "compressed %zu to %zu", n, zl);
+    CHECK(z && zl < n, "compressed %lu to %lu", (unsigned long)n, (unsigned long)zl);
     uint8_t *back = z ? zip_inflate(z, zl, n, &ol) : NULL;
     CHECK(back && ol == n && !memcmp(back, data, n), "round trip");
     free(back);

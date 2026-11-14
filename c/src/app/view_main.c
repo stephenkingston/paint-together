@@ -484,5 +484,4 @@ int view_keys(app *a)
 void view_free(void)
 {
     view_free_previews();
-    view_free_picture();
 }

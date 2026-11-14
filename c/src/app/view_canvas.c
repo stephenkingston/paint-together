@@ -3,9 +3,8 @@
  * paint_friends, paint_caret, selection_menu, ants and paint_tool_pointer)
  *
  * The picture is drawn straight from the app's image with gfx_canvas every
- * frame (no zoomed copy is kept). Only while friends are drawing is a merged
- * copy kept (their unfinished drawing over the picture), updated where it
- * changed, and freed when they stop.
+ * frame (no zoomed copy is kept), with friends' unfinished drawing over it
+ * (gfx_canvas_over) while there is any.
  *
  * Geometry: everything is in device pixels; `zs` is device pixels per
  * picture pixel (the zoom times the display scale). The Rust's sizes are
@@ -20,41 +19,12 @@
 
 /* ---- the picture as shown ---- */
 
-static img *merged;     /* the picture with friends' drawing in progress, while there is any */
-
 const img *view_picture(app *a)
 {
     irect r;
-    int changed = app_take_dirty(a, &r);
-    const img *ov = app_friends_overlay(a);
-    if (!ov)
-    {
-        img_free(merged);
-        merged = NULL;
-        return a->img;
-    }
-    if (!merged || merged->w != a->img->w || merged->h != a->img->h)
-    {
-        img_free(merged);
-        merged = img_new(a->img->w, a->img->h, (rgba){ 0, 0, 0, 0 });
-        if (!merged)
-            return a->img;
-        r = irect_of(a->img);
-        changed = 1;
-    }
-    if (changed)
-    {
-        r = irect_intersect(r, irect_of(a->img));
-        for (int y = r.y0; y < r.y1; y++)
-            app_with_friends(a->img, ov, irect_make(r.x0, y, r.x1, y + 1), img_at(merged, r.x0, y));
-    }
-    return merged;
-}
-
-void view_free_picture(void)
-{
-    img_free(merged);
-    merged = NULL;
+    app_take_dirty(a, &r);
+    gfx_canvas_over(app_friends_overlay(a));
+    return a->img;
 }
 
 /* ---- input: the pointer over the picture goes to the app ---- */
@@ -249,7 +219,7 @@ static void rulers(app *a, rect full, rect panel, rect crect)
                 continue;
             int is_major = fabsf(roundf(v / major) * major - v) < 1e-3f, is_half = fabsf(roundf(v / (major / 2)) * (major / 2) - v) < 1e-3f;
             int len = S(is_major ? APP_RULER - 3 : is_half ? 7 : 4), p = (int)floorf(at);
-            snprintf(num, sizeof num, "%lld", (long long)v);
+            snprintf(num, sizeof num, "%d", (int)v);  /* (not %lld: XP's msvcrt.dll can't print long long) */
             if (!axis)
             {
                 gfx_fill(d, rect_make(p, r.y + r.h - len, HAIR(), len), tick);

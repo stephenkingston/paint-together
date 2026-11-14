@@ -36,6 +36,7 @@ typedef struct
     uint32_t w, h;
     uint8_t *rgba;
     size_t len;
+    int borrowed;           /* rgba is someone else's (a hub's picture, while its welcome goes out) */
 } picture;
 
 enum
@@ -67,8 +68,8 @@ int patch_eq(const patch *a, const patch *b);
 
 /* Holds exactly the bytes its size needs, and a size Paint can open */
 int picture_valid(const picture *pic);
-picture picture_of(const img *im);
 img *picture_to_image(const picture *pic);          /* NULL if not valid */
+img *picture_take(picture *pic);                    /* the same, taking pic's pixels (pic is emptied) */
 
 /* Its mask and pixels agree with its size (anything from the network is checked) */
 int patch_valid(const patch *p);

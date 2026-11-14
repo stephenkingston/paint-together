@@ -2,15 +2,14 @@
  * Paint (C port) - the one place the vendored stb libraries are compiled
  *
  * third_party/stb: stb_image 2.30, stb_image_write 1.16, stb_truetype 1.26
- * (public domain / MIT). Only the decoders Paint offers are built.
+ * (public domain / MIT). Only the decoders of the formats the Rust Paint
+ * opens (through the image crate) are built: no TGA or PNM.
  */
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
 #define STBI_ONLY_BMP
 #define STBI_ONLY_GIF
-#define STBI_ONLY_TGA
-#define STBI_ONLY_PNM
 #define STBI_NO_STDIO
 #include "stb_image.h"
 

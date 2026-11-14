@@ -180,10 +180,14 @@ uint8_t *net_frame(bytes *raw, size_t *len)
         bytes_free(raw);
         if (!z)
             return NULL;
-        frame = malloc(zlen + 5);
-        if (frame)
-            memcpy(frame + 5, z, zlen);
-        free(z);
+        /* The header goes in front, in the same buffer (a welcome's picture isn't held twice) */
+        frame = realloc(z, zlen + 5);
+        if (!frame)
+        {
+            free(z);
+            return NULL;
+        }
+        memmove(frame + 5, frame, zlen);
         flag = 1;
         n = zlen;
     }
@@ -403,14 +407,18 @@ static void drop_sink(hub_thread *t, int i)
 }
 
 /* Pass one of the hub's messages on; 0 when that kid's connection is gone.
- * `f` is the message's frame, made the first time a friend needs it. */
-static int deliver(hub_thread *t, const sink *s, const from_hub *msg, frame **f)
+ * `f` is the message's frame, made the first time a friend needs it. A message
+ * for one kid only is handed over whole to my own app (the welcome's picture isn't copied). */
+static int deliver(hub_thread *t, const sink *s, from_hub *msg, int only, frame **f)
 {
     if (s->local)
     {
         if (msg->kind == FROM_PING)
             return 1;
-        from_hub copy = from_hub_clone(msg);
+        only &= !msg->picture.borrowed;
+        from_hub copy = only ? *msg : from_hub_clone(msg);
+        if (only)
+            memset(msg, 0, sizeof *msg);
         return push_event(s->q, LINK_MESSAGE, &copy, NULL, t->wake);
     }
     if (!*f)
@@ -438,7 +446,8 @@ static void route(hub_thread *t, hub_out *out)
         {
             const sink *s = &t->sinks[k];
             for (int i = 0; i < out->n; i++)
-                if (hub_wants(t->h, out->v[i].to, out->v[i].id, s->id) && !deliver(t, s, &out->v[i].msg, &frames[i]))
+                if (hub_wants(t->h, out->v[i].to, out->v[i].id, s->id)
+                    && !deliver(t, s, &out->v[i].msg, out->v[i].to == TO_ONE, &frames[i]))
                 {
                     gone[n_gone++] = s->id;
                     break;

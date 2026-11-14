@@ -18,6 +18,7 @@
 #define COLLAB_SESSION_H
 
 #include "collab/protocol.h"
+#include "paint/snap.h"
 
 /* Patches by tile, (tx, ty) -> patch (an open-addressing table) */
 typedef struct
@@ -86,8 +87,11 @@ typedef struct
     int n_pointers;
     double now;             /* the app's clock, for timing pointers */
 
-    /* private */
+    /* private. `confirmed` is kept whole (confirmed_) only while one of my unconfirmed edits
+     * changes the whole picture; otherwise it is `base` with the pixels my unconfirmed edits
+     * covered put back, kept by tile (under_) */
     img *confirmed_;
+    snap *under_;
     uint64_t seq_;
     pending_edit *pending_;
     int n_pending_;

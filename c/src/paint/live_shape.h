@@ -10,6 +10,7 @@
 
 #include "paint/raster.h"
 #include "paint/shapes.h"
+#include "paint/snap.h"
 
 /* How the shape is drawn; taken from the ribbon, so changing it there restyles the shape */
 typedef struct
@@ -24,7 +25,8 @@ typedef struct
     shape_kind kind;
     pt a, b;            /* corners of the box (or a line's end points), in canvas pixels */
     int swapped;        /* drawn with the right button: Color 1 and Color 2 swap roles */
-    img *snapshot;      /* the picture under the shape (owned) */
+    img *snapshot;      /* the picture under the shape (owned)... */
+    snap *under;        /* ...or, when there's none, the parts of it the shape has covered */
     mask *fill_mask, *line_mask;
     irect drawn, touched;
     int rendered;       /* the key below is valid */
@@ -35,6 +37,9 @@ typedef struct
 
 /* Takes ownership of snapshot. NULL if out of memory (snapshot is then freed). */
 live_shape *live_shape_new(shape_kind kind, pt at, int swapped, img *snapshot);
+/* The same keeping only what the shape covers of pic (snap.h: until the shape is
+ * committed, only it and live_shape_rebase may change pic) */
+live_shape *live_shape_over(shape_kind kind, pt at, int swapped, const img *pic);
 void live_shape_free(live_shape *s);
 
 int live_shape_is_line(const live_shape *s);
@@ -49,6 +54,8 @@ irect live_shape_render(live_shape *s, img *im, shape_style style);
 /* The picture under the shape changed in r (a friend drew there): use theirs as
  * the background and redraw on the next render */
 void live_shape_rebase(live_shape *s, const img *base, irect r);
+/* The undo step for the shape drawn on im */
+change *live_shape_change(const live_shape *s, const img *im);
 /* Put back what was under the shape; returns the pixels to refresh */
 irect live_shape_erase(const live_shape *s, img *im);
 /* Handle positions in canvas pixels: the ends of a line (2), or eight around a

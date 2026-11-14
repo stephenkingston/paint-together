@@ -371,6 +371,7 @@ void app_leave_together(app *a)
         a->session = NULL;
         history_clear(a->history);
         marks_clear(a);
+        a->trim_ = 1;
         a->saved_state = dirty ? UINT64_MAX : history_state_id(a->history);
     }
 }
@@ -481,7 +482,8 @@ static void step_handover(app *a)
 typedef struct
 {
     const img *base;
-    img *under;
+    snap *under;
+    img *screen;
     irect r;
     rgba color;
 } refill_ctx;
@@ -490,7 +492,10 @@ static void refill(int x, int y, const uint8_t px[4], void *user)
 {
     refill_ctx *c = user;
     if (irect_contains(c->r, (float)x, (float)y) && !memcmp(img_at(c->base, x, y), px, 4))
-        memcpy(img_at(c->under, x, y), &c->color, 4);
+    {
+        memcpy(snap_px(c->under, x, y), &c->color, 4);
+        memcpy(img_at(c->screen, x, y), &c->color, 4);
+    }
 }
 
 /* A friend's edit changed `base` in the region: put it under whatever I'm in
@@ -515,12 +520,12 @@ void app_rebase(app *a, region rg)
     }
     irect r = rg.r;
     if (a->op.kind == OP_STROKE)
-        raster_copy_rect(a->op.snapshot, base, r);
+        snap_rebase(a->op.snapshot, base, r);
     if (a->live)
         live_shape_rebase(a->live, base, r);
     if (a->text)
     {
-        raster_copy_rect(a->text->snapshot, base, r);
+        snap_rebase(a->text->snapshot, base, r);
         a->text->rendered = 0;
     }
     floating *f = a->sel ? a->sel->fl : NULL;
@@ -528,22 +533,25 @@ void app_rebase(app *a, region rg)
     {
         if (f->before)
             raster_copy_rect(f->before, base, r);
-        else if (f->lifted)
+        else if ((f->lifted || f->lifted_is_pixels) && !irect_empty(irect_intersect(r, f->origin)))
         {
             /* `before` is `base` outside the lifted area, so only that part needs it */
             irect in = irect_intersect(r, f->origin);
+            if (f->lifted_is_pixels)
+                f->lifted = img_dup(f->pixels), f->lifted_is_pixels = 0;
             for (int y = in.y0; y < in.y1; y++)
                 if (in.x1 > in.x0)
                     memcpy(img_at(f->lifted, in.x0 - f->origin.x0, y - f->origin.y0), img_at(base, in.x0, y), (size_t)(in.x1 - in.x0) * 4);
         }
-        raster_copy_rect(f->base, base, r);
-        /* The hole stays Color 2, except where a friend has drawn into it since */
+        /* The canvas underneath (the picture, and the tiles kept apart from it) takes base's pixels */
+        raster_copy_rect(a->img, base, r);
+        snap_rebase(f->base, base, r);
+        /* The hole stays Color 2, except where a friend has drawn into it since (the hole's tiles are kept) */
         if (f->has_hole)
         {
-            refill_ctx ctx = { base, f->base, r, f->hole_color };
+            refill_ctx ctx = { base, f->base, a->img, r, f->hole_color };
             patch_each(&f->hole, refill, &ctx);
         }
-        raster_copy_rect(a->img, f->base, r);
     }
     else
         raster_copy_rect(a->img, base, r);
@@ -560,7 +568,7 @@ void app_rebase(app *a, region rg)
 
 static void welcome(app *a, from_hub *msg)
 {
-    img *im = picture_to_image(&msg->picture);
+    img *im = picture_take(&msg->picture);
     if (!im)
         return;
     free(a->asking);
@@ -599,11 +607,12 @@ static void welcome(app *a, from_hub *msg)
     history_clear(a->history);
     marks_clear(a);
     session_free(a->session);
+    /* My old picture goes first, so three aren't held at once */
+    img_free(a->img);
+    a->img = im;
     a->session = session_new(msg->you, msg->host, msg->seq, img_dup(im), kids);
     a->session->ask_first = msg->yes;
     a->saved_version = 0;
-    img_free(a->img);
-    a->img = im;
     a->dirty_full = 1;
     a->fit_pending = 1;
     a->scroll_x = a->scroll_y = 0.0f;
@@ -801,6 +810,11 @@ int app_tick(app *a, double now)
             changed = 1;
     a->n_toasts = k;
     app_flush_network(a);
+    if (a->trim_ && a->op.kind == OP_IDLE)
+    {
+        a->trim_ = 0;
+        os_trim();
+    }
     return changed || app_needs_repaint(a);
 }
 

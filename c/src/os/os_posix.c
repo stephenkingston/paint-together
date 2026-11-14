@@ -20,6 +20,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -544,6 +548,34 @@ char *os_read_file(const char *path, size_t *len)
     if (len)
         *len = n;
     return buf;
+}
+
+void os_trim(void)
+{
+#ifdef __GLIBC__
+    malloc_trim(0);
+#endif
+}
+
+const void *os_map_file(const char *path, size_t *len)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    void *p = MAP_FAILED;
+    if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0 && (uint64_t)st.st_size <= SIZE_MAX)
+        p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (fd >= 0)
+        close(fd);
+    if (p == MAP_FAILED)
+        return NULL;
+    *len = (size_t)st.st_size;
+    return p;
+}
+
+void os_unmap_file(const void *data, size_t len)
+{
+    if (data)
+        munmap((void *)data, len);
 }
 
 int os_write_file(const char *path, const void *data, size_t len)

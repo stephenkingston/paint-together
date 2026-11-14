@@ -35,7 +35,8 @@ typedef struct
     char *path;
     int index;          /* face inside a .ttc */
     int state;          /* 0 not read yet, 1 ready, -1 unusable */
-    unsigned char *data;
+    const unsigned char *data;  /* the file, mapped */
+    size_t size;
     stbtt_fontinfo info;
     float xh;           /* x-height in font units (the top of 'x'), 0 if unknown */
 } face;
@@ -284,15 +285,14 @@ static int load(int which)
     if (fc->state)
         return fc->state > 0;
     fc->state = -1;
-    size_t len = 0;
-    if (!fc->path || !(fc->data = (unsigned char *)os_read_file(fc->path, &len)))
+    if (!fc->path || !(fc->data = os_map_file(fc->path, &fc->size)))
         return 0;
     if (fc->index == BOLD_IN_COLLECTION)
         fc->index = bold_index(fc->data);
     int offset = stbtt_GetFontOffsetForIndex(fc->data, fc->index);
     if (offset < 0 || !stbtt_InitFont(&fc->info, fc->data, offset))
     {
-        free(fc->data);
+        os_unmap_file(fc->data, fc->size);
         fc->data = NULL;
         return 0;
     }

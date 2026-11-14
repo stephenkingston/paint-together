@@ -100,6 +100,15 @@ void mask_clear(mask *m, irect r)
             }
             for (int y = c.y0; y < c.y1; y++)
                 memset(*t + ((y - tr.y0) << MASK_TILE_SHIFT) + (c.x0 - tr.x0), 0, (size_t)(c.x1 - c.x0) * sizeof(float));
+            /* A tile left all zero goes too (a moving shape's outline would otherwise leave a trail of them) */
+            int i = 0;
+            while (i < MASK_TILE * MASK_TILE && (*t)[i] == 0.0f)
+                i++;
+            if (i == MASK_TILE * MASK_TILE)
+            {
+                free(*t);
+                *t = NULL;
+            }
         }
     }
 }
@@ -414,6 +423,16 @@ static float dist2(const uint8_t *c, rgba target)
     return d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
 }
 
+/* A bit per pixel */
+static inline int bit(const uint8_t *b, size_t i)
+{
+    return b[i >> 3] >> (i & 7) & 1;
+}
+static inline void set_bit(uint8_t *b, size_t i)
+{
+    b[i >> 3] |= (uint8_t)(1 << (i & 7));
+}
+
 /* Push the in-bounds 4-neighbours of (x, y) in the Rust's order: left, right, up, down */
 static void push_neighbours(seed_stack *s, const uint8_t *filled, int w, int h, int x, int y, float t, int unfilled_only)
 {
@@ -423,42 +442,53 @@ static void push_neighbours(seed_stack *s, const uint8_t *filled, int w, int h, 
         int nx = nb[k][0], ny = nb[k][1];
         if (nx < 0 || ny < 0 || nx >= w || ny >= h)
             continue;
-        if (unfilled_only && filled[(size_t)ny * w + nx])
+        if (unfilled_only && bit(filled, (size_t)ny * w + nx))
             continue;
         push(s, nx, ny, t);
     }
+}
+
+static int cmp_fill_px(const void *a, const void *b)
+{
+    const fill_px *p = a, *q = b;
+    return p->y != q->y ? (p->y > q->y) - (p->y < q->y) : (p->x > q->x) - (p->x < q->x);
 }
 
 /* Anti-aliased edges are blends of the old colour and the boundary's colour, so a plain
  * fill stops short of them and leaves a pale ring. Walk outwards from the filled area and
  * give each blended pixel the same mix of the new colour and the boundary colour. The walk
  * only continues while pixels get closer to the boundary colour, so it never crosses an
- * outline, and pixels that simply match the old colour (unconnected areas) are left alone. */
-static irect fill_antialiased_edges(img *im, const uint8_t *filled, rgba target, rgba color, uint8_t tolerance)
+ * outline, and pixels that simply match the old colour (unconnected areas) are left alone.
+ * The re-mixed pixels go into the plan (sorted by row), for the fill to write. */
+static irect fill_antialiased_edges(const img *im, fill_plan *fp, rgba target, uint8_t tolerance)
 {
     int w = im->w, h = im->h;
-    uint8_t *edge = calloc((size_t)w * h, 1);
+    const uint8_t *filled = fp->filled;
+    rgba color = fp->color;
+    uint8_t *edge = calloc(((size_t)w * h + 7) / 8, 1);
     if (!edge)
         return IRECT_EMPTY;
     seed_stack stack = { 0 };
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++)
-            if (filled[(size_t)y * w + x])
+        {
+            size_t i = (size_t)y * w + x;
+            if (!(i & 7) && x + 8 <= w && !filled[i >> 3])
+            {
+                x += 7;
+                continue;
+            }
+            if (bit(filled, i))
                 push_neighbours(&stack, filled, w, h, x, y, 0.0f, 1);
+        }
     float min_dist = fmaxf((float)tolerance, 8.0f);
-    typedef struct
-    {
-        int x, y;
-        rgba c;
-    } edit;
-    edit *edits = NULL;
-    size_t nedits = 0, capedits = 0;
+    size_t capedits = 0;
     while (stack.n)
     {
         seed sd = stack.v[--stack.n];
         int x = sd.x, y = sd.y;
         size_t i = (size_t)y * w + x;
-        if (filled[i] || edge[i])
+        if (bit(filled, i) || bit(edge, i))
             continue;
         const uint8_t *n = img_at(im, x, y);
         if (sqrtf(dist2(n, target)) <= min_dist)
@@ -471,7 +501,7 @@ static irect fill_antialiased_edges(img *im, const uint8_t *filled, rgba target,
             {
                 size_t j = (size_t)ny * w + nx;
                 const uint8_t *c = img_at(im, nx, ny);
-                if (!filled[j] && !edge[j] && dist2(c, target) > dist2(boundary, target))
+                if (!bit(filled, j) && !bit(edge, j) && dist2(c, target) > dist2(boundary, target))
                     boundary = c;
             }
         }
@@ -486,42 +516,44 @@ static irect fill_antialiased_edges(img *im, const uint8_t *filled, rgba target,
         float t = clampf(dot / len2, 0.0f, 1.0f);
         if (t >= 0.97f || t <= sd.t + 0.01f)
             continue;
-        edge[i] = 1;
+        set_bit(edge, i);
         const uint8_t cc[4] = { color.r, color.g, color.b, color.a };
         uint8_t mix[4];
         for (int k = 0; k < 4; k++)
             mix[k] = (uint8_t)roundf((float)cc[k] * (1.0f - t) + (float)boundary[k] * t);
-        if (nedits == capedits)
+        if (fp->n_edges == capedits)
         {
             capedits = capedits ? capedits * 2 : 256;
-            edits = realloc(edits, capedits * sizeof(edit));
+            fp->edges = realloc(fp->edges, capedits * sizeof(fill_px));
         }
-        edits[nedits++] = (edit){ x, y, { mix[0], mix[1], mix[2], mix[3] } };
+        fp->edges[fp->n_edges++] = (fill_px){ x, y, { mix[0], mix[1], mix[2], mix[3] } };
         push_neighbours(&stack, filled, w, h, x, y, t, 0);
     }
     irect out = IRECT_EMPTY;
-    for (size_t k = 0; k < nedits; k++)
-    {
-        put_px(im, edits[k].x, edits[k].y, edits[k].c);
-        out = irect_union(out, irect_make(edits[k].x, edits[k].y, edits[k].x + 1, edits[k].y + 1));
-    }
-    free(edits);
+    for (size_t k = 0; k < fp->n_edges; k++)
+        out = irect_union(out, irect_make(fp->edges[k].x, fp->edges[k].y, fp->edges[k].x + 1, fp->edges[k].y + 1));
+    if (fp->n_edges)
+        qsort(fp->edges, fp->n_edges, sizeof(fill_px), cmp_fill_px);
     free(stack.v);
     free(edge);
     return out;
 }
 
-irect raster_flood_fill(img *im, int x, int y, rgba color, uint8_t tolerance)
+int raster_fill_plan(const img *im, int x, int y, rgba color, uint8_t tolerance, fill_plan *fp)
 {
     int w = im->w, h = im->h;
+    memset(fp, 0, sizeof *fp);
+    fp->r = IRECT_EMPTY;
+    fp->color = color;
     if (x < 0 || y < 0 || x >= w || y >= h)
-        return IRECT_EMPTY;
+        return 0;
     rgba target = get_px(im, x, y);
     if (rgba_eq(target, color) && tolerance == 0)
-        return IRECT_EMPTY;
-    uint8_t *visited = calloc((size_t)w * h, 1);
+        return 0;
+    /* The fill is worked out without writing a pixel: what it has filled is in `visited` */
+    uint8_t *visited = calloc(((size_t)w * h + 7) / 8, 1);
     if (!visited)
-        return IRECT_EMPTY;
+        return 0;
     seed_stack stack = { 0 };
     push(&stack, x, y, 0.0f);
     irect out = IRECT_EMPTY;
@@ -531,19 +563,16 @@ irect raster_flood_fill(img *im, int x, int y, rgba color, uint8_t tolerance)
         seed sd = stack.v[--stack.n];
         int sx = sd.x, sy = sd.y;
         size_t row = (size_t)sy * w;
-        if (visited[row + sx] || !px_matches(img_at(im, sx, sy), target, tol))
+        if (bit(visited, row + sx) || !px_matches(img_at(im, sx, sy), target, tol))
             continue;
         int lx = sx;
-        while (lx > 0 && !visited[row + lx - 1] && px_matches(img_at(im, lx - 1, sy), target, tol))
+        while (lx > 0 && !bit(visited, row + lx - 1) && px_matches(img_at(im, lx - 1, sy), target, tol))
             lx--;
         int rx = sx;
-        while (rx + 1 < w && !visited[row + rx + 1] && px_matches(img_at(im, rx + 1, sy), target, tol))
+        while (rx + 1 < w && !bit(visited, row + rx + 1) && px_matches(img_at(im, rx + 1, sy), target, tol))
             rx++;
         for (int px = lx; px <= rx; px++)
-        {
-            visited[row + px] = 1;
-            put_px(im, px, sy, color);
-        }
+            set_bit(visited, row + px);
         out = irect_union(out, irect_make(lx, sy, rx + 1, sy + 1));
         const int nys[2] = { sy - 1, sy + 1 };
         for (int k = 0; k < 2; k++)
@@ -555,10 +584,10 @@ irect raster_flood_fill(img *im, int x, int y, rgba color, uint8_t tolerance)
             int px = lx;
             while (px <= rx)
             {
-                if (!visited[nrow + px] && px_matches(img_at(im, px, ny), target, tol))
+                if (!bit(visited, nrow + px) && px_matches(img_at(im, px, ny), target, tol))
                 {
                     push(&stack, px, ny, 0.0f);
-                    while (px <= rx && !visited[nrow + px] && px_matches(img_at(im, px, ny), target, tol))
+                    while (px <= rx && !bit(visited, nrow + px) && px_matches(img_at(im, px, ny), target, tol))
                         px++;
                 }
                 else
@@ -567,9 +596,58 @@ irect raster_flood_fill(img *im, int x, int y, rgba color, uint8_t tolerance)
         }
     }
     free(stack.v);
-    out = irect_union(out, fill_antialiased_edges(im, visited, target, color, tolerance));
-    free(visited);
-    return out;
+    fp->w = w;
+    fp->filled = visited;
+    fp->r = irect_union(out, fill_antialiased_edges(im, fp, target, tolerance));
+    return 1;
+}
+
+void raster_fill_row(const fill_plan *fp, const img *im, int y, uint8_t *out)
+{
+    irect r = fp->r;
+    if (out != img_at(im, r.x0, y))
+        memcpy(out, img_at(im, r.x0, y), (size_t)irect_w(r) * 4);
+    const uint8_t *row = fp->filled;
+    size_t base = (size_t)y * fp->w;
+    for (int x = r.x0; x < r.x1; x++)
+        if (bit(row, base + x))
+            memcpy(out + (size_t)(x - r.x0) * 4, &fp->color, 4);
+    /* The edge pixels of this row: a binary search for its first */
+    size_t lo = 0, hi = fp->n_edges;
+    while (lo < hi)
+    {
+        size_t mid = (lo + hi) / 2;
+        if (fp->edges[mid].y < y)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    for (; lo < fp->n_edges && fp->edges[lo].y == y; lo++)
+        memcpy(out + (size_t)(fp->edges[lo].x - r.x0) * 4, &fp->edges[lo].c, 4);
+}
+
+void raster_fill_apply(const fill_plan *fp, img *im)
+{
+    for (int y = fp->r.y0; y < fp->r.y1; y++)
+        raster_fill_row(fp, im, y, img_at(im, fp->r.x0, y));
+}
+
+void raster_fill_free(fill_plan *fp)
+{
+    free(fp->filled);
+    free(fp->edges);
+    memset(fp, 0, sizeof *fp);
+}
+
+irect raster_flood_fill(img *im, int x, int y, rgba color, uint8_t tolerance)
+{
+    fill_plan fp;
+    if (!raster_fill_plan(im, x, y, color, tolerance, &fp))
+        return IRECT_EMPTY;
+    raster_fill_apply(&fp, im);
+    irect r = fp.r;
+    raster_fill_free(&fp);
+    return r;
 }
 
 img *raster_resize_canvas(const img *im, int w, int h, rgba fill)

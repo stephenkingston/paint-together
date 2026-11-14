@@ -16,7 +16,6 @@
  * from the 'kern' table only. stb_truetype draws the glyphs.
  */
 #include <math.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "os/os.h"
@@ -158,19 +157,15 @@ static void add_face(const char *name, int bold, int italic, uint32_t path, int 
         *s = (face_ref){ path, index };
 }
 
-/* A font file, read in pieces: a FILE when the C library can open the path,
- * else (a name it can't spell on Windows) the whole file through os_read_file */
+/* A font file, mapped: only the pages of the tables read are touched */
 typedef struct
 {
-    FILE *f;
-    char *mem;
+    const char *mem;
     size_t len;
 } src;
 
 static int src_read(src *s, uint32_t off, void *buf, size_t n)
 {
-    if (s->f)
-        return fseek(s->f, (long)off, SEEK_SET) == 0 && fread(buf, 1, n, s->f) == n ? 0 : -1;
     if (off > s->len || n > s->len - off)
         return -1;
     memcpy(buf, s->mem + off, n);
@@ -295,17 +290,13 @@ static void scan_face(src *s, uint32_t start, uint32_t path, int index)
     /* Bitmap-only faces (colour emoji) and CFF2 variable fonts have nothing stb_truetype can draw */
     if (outlines != 1 || !name_off || name_len < 6 || name_len > (1u << 20))
         return;
-    uint8_t *names = malloc(name_len);
-    if (!names || src_read(s, name_off, names, name_len))
-    {
-        free(names);
+    if (name_off > s->len || name_len > s->len - name_off)
         return;
-    }
+    const uint8_t *names = (const uint8_t *)s->mem + name_off;
     char fam[256];
 #ifdef _WIN32
     /* Windows: name ID 1 and the bold/italic flags */
     int ok = name_get(names, name_len, 1, fam, sizeof fam);
-    free(names);
     if (!ok)
         return;
     uint8_t os2[64], post[8];
@@ -318,7 +309,6 @@ static void scan_face(src *s, uint32_t start, uint32_t path, int index)
     int ok = name_get(names, name_len, 16, fam, sizeof fam) || name_get(names, name_len, 1, fam, sizeof fam);
     if (ok && !name_get(names, name_len, 17, style, sizeof style) && !name_get(names, name_len, 2, style, sizeof style))
         style[0] = 0;
-    free(names);
     (void)os2_off, (void)os2_len, (void)post_off;
     if (!ok)
         return;
@@ -358,8 +348,8 @@ static int is_font_file(const char *name)
 
 static void scan_file(const char *path)
 {
-    src s = { fopen(path, "rb"), NULL, 0 };
-    if (!s.f && !(s.mem = os_read_file(path, &s.len)))
+    src s = { NULL, 0 };
+    if (!(s.mem = os_map_file(path, &s.len)))
         return;
     uint8_t head[12];
     uint32_t p = 0;
@@ -382,9 +372,7 @@ static void scan_file(const char *path)
         else
             scan_face(&s, 0, pool_add(path) + 1, 0);
     }
-    if (s.f)
-        fclose(s.f);
-    free(s.mem);
+    os_unmap_file(s.mem, s.len);
 }
 
 typedef struct
@@ -529,7 +517,8 @@ int fonts_default_family(void)
 
 struct font_face
 {
-    char *data;                 /* the whole font file */
+    const char *data;           /* the whole font file, mapped */
+    size_t len;
     stbtt_fontinfo info;
     float asc, desc, gap;       /* unscaled, as ttf-parser reports them */
     uint32_t path;
@@ -543,7 +532,7 @@ void fonts_release(void)
 {
     if (loaded)
     {
-        free(loaded->data);
+        os_unmap_file(loaded->data, loaded->len);
         free(loaded);
         loaded = NULL;
     }
@@ -625,12 +614,12 @@ int fonts_load(int fam_index, int bold, int italic, paint_font *out)
     {
         fonts_release();
         font_face *f = calloc(1, sizeof *f);
-        size_t len = 0;
-        if (!f || !(f->data = os_read_file(lib.pool + face.path - 1, &len)))
+        if (!f || !(f->data = os_map_file(lib.pool + face.path - 1, &f->len)))
         {
             free(f);
             return -1;
         }
+        size_t len = f->len;
         const unsigned char *d = (const unsigned char *)f->data;
         int off = stbtt_GetFontOffsetForIndex(d, face.index);
         int ok = off >= 0 && stbtt_InitFont(&f->info, d, off);
@@ -653,7 +642,7 @@ int fonts_load(int fam_index, int bold, int italic, paint_font *out)
         }
         if (!ok)
         {
-            free(f->data);
+            os_unmap_file(f->data, len);
             free(f);
             return -1;
         }
@@ -662,7 +651,7 @@ int fonts_load(int fam_index, int bold, int italic, paint_font *out)
         vmetrics(f, len);
         if (f->asc - f->desc <= 0.0f)
         {
-            free(f->data);
+            os_unmap_file(f->data, len);
             free(f);
             return -1;
         }

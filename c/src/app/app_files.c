@@ -481,7 +481,7 @@ void app_ask_path_cancel(app *a)
 void app_format_bytes(int64_t b, char *buf, size_t cap)
 {
     if (b < 1024)
-        snprintf(buf, cap, "%lld bytes", (long long)b);
+        snprintf(buf, cap, "%d bytes", (int)b);   /* (not %lld: XP's msvcrt.dll can't print long long) */
     else if (b < 1048576)
         snprintf(buf, cap, "%.1fKB", (double)b / 1024.0);
     else

@@ -42,8 +42,8 @@ extern view_state V;
 void view_ribbon(app *a, rect full);       /* the tab strip and (unless minimized) the ribbon */
 void view_canvas(app *a, rect full);       /* the picture area, rulers included */
 void view_canvas_input(app *a);             /* this frame's pointer events over the picture go to the app */
-const img *view_picture(app *a);            /* the picture as shown (with friends' drawing in progress) */
-void view_free_picture(void);
+/* The picture to show, with friends' drawing in progress set for the next gfx_canvas */
+const img *view_picture(app *a);
 void view_free_previews(void);
 void view_full_screen(app *a, rect full);
 void view_dialogs(app *a);

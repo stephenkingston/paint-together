@@ -1,8 +1,8 @@
 /*
  * Paint (C port) - editable shapes (Rust: live_shape.rs)
  *
- * The two coverage masks are tiled (raster.h), so a live shape costs its
- * snapshot plus only the tiles its outline and fill cover.
+ * The two coverage masks are tiled (raster.h), and so is what's under the
+ * shape (snap.h), so a live shape costs only the tiles it has covered.
  */
 #include <math.h>
 #include <stdlib.h>
@@ -11,31 +11,40 @@
 /* Handle directions around the box, clockwise from the top-left corner */
 static const signed char HANDLES[8][2] = { { -1, -1 }, { 0, -1 }, { 1, -1 }, { 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 }, { -1, 0 } };
 
-live_shape *live_shape_new(shape_kind kind, pt at, int swapped, img *snapshot)
+/* Takes ownership of snapshot (NULL: kept by tile from pic as the shape draws) */
+static live_shape *start(shape_kind kind, pt at, int swapped, img *snapshot, const img *pic)
 {
     live_shape *s = calloc(1, sizeof *s);
     if (s)
     {
-        s->fill_mask = mask_new(snapshot->w, snapshot->h);
-        s->line_mask = mask_new(snapshot->w, snapshot->h);
+        s->snapshot = snapshot;
+        s->under = snapshot ? NULL : snap_new(pic);
+        s->fill_mask = mask_new(pic->w, pic->h);
+        s->line_mask = mask_new(pic->w, pic->h);
     }
-    if (!s || !s->fill_mask || !s->line_mask)
+    if (!s || (!snapshot && !s->under) || !s->fill_mask || !s->line_mask)
     {
         if (s)
-        {
-            mask_free(s->fill_mask);
-            mask_free(s->line_mask);
-        }
-        free(s);
-        img_free(snapshot);
+            live_shape_free(s);
+        else
+            img_free(snapshot);
         return NULL;
     }
     s->kind = kind;
     s->a = s->b = at;
     s->swapped = swapped;
-    s->snapshot = snapshot;
     s->drawn = s->touched = IRECT_EMPTY;
     return s;
+}
+
+live_shape *live_shape_new(shape_kind kind, pt at, int swapped, img *snapshot)
+{
+    return snapshot ? start(kind, at, swapped, snapshot, snapshot) : NULL;
+}
+
+live_shape *live_shape_over(shape_kind kind, pt at, int swapped, const img *pic)
+{
+    return start(kind, at, swapped, NULL, pic);
 }
 
 void live_shape_free(live_shape *s)
@@ -43,10 +52,32 @@ void live_shape_free(live_shape *s)
     if (s)
     {
         img_free(s->snapshot);
+        snap_free(s->under);
         mask_free(s->fill_mask);
         mask_free(s->line_mask);
         free(s);
     }
+}
+
+/* The shape draws on a tile only where its masks have one */
+static int drawn_on(irect tile, void *user)
+{
+    const live_shape *s = user;
+    return snap_mask_has(s->fill_mask, tile) || snap_mask_has(s->line_mask, tile);
+}
+
+/* Put back what was under the shape in r */
+static void restore(const live_shape *s, img *im, irect r)
+{
+    if (s->under)
+        snap_restore(s->under, im, r);
+    else
+        raster_copy_rect(im, s->snapshot, r);
+}
+
+change *live_shape_change(const live_shape *s, const img *im)
+{
+    return s->under ? snap_change(s->under, im, s->touched) : change_patch(s->snapshot, im, s->touched);
 }
 
 int live_shape_is_line(const live_shape *s)
@@ -99,7 +130,14 @@ irect live_shape_render(live_shape *s, img *im, shape_style style)
         }
     }
     irect region = irect_union(s->drawn, r);
-    raster_copy_rect(im, s->snapshot, region);
+    if (s->under)
+    {
+        snap_keep(s->under, im, r, s->fill_mask);
+        snap_keep(s->under, im, r, s->line_mask);
+    }
+    restore(s, im, region);
+    if (s->under)
+        snap_drop(s->under, region, drawn_on, s);
     if (fill)
         raster_blend_mask(im, s->fill_mask, style.fill_color, 1.0f, r);
     if (outline)
@@ -116,13 +154,16 @@ irect live_shape_render(live_shape *s, img *im, shape_style style)
 
 void live_shape_rebase(live_shape *s, const img *base, irect r)
 {
-    raster_copy_rect(s->snapshot, base, r);
+    if (s->under)
+        snap_rebase(s->under, base, r);
+    else
+        raster_copy_rect(s->snapshot, base, r);
     s->rendered = 0;
 }
 
 irect live_shape_erase(const live_shape *s, img *im)
 {
-    raster_copy_rect(im, s->snapshot, s->touched);
+    restore(s, im, s->touched);
     return s->touched;
 }
 

@@ -2,10 +2,10 @@
  * Paint (C port) - the app's state and every tool's behaviour (Rust: app.rs, PaintApp)
  *
  * Drawing tools never paint straight onto the picture: an operation keeps
- * what it needs to redraw itself from scratch (a snapshot, a coverage mask,
- * the live shape's or text box's own snapshot) until it is finished, and is
- * then recorded as one undo step. Those buffers are freed as soon as the
- * operation ends.
+ * what it needs to redraw itself from scratch (a coverage mask, and the
+ * picture as it was under it, kept only by tile where it has drawn: snap.h)
+ * until it is finished, and is then recorded as one undo step. Those buffers
+ * are freed as soon as the operation ends.
  */
 #include <math.h>
 #include <stdarg.h>
@@ -162,6 +162,7 @@ void app_mark(app *a, irect r)
 
 void app_record(app *a, change *c)
 {
+    a->trim_ = 1;
     if (!c)
         return;
     session *s = a->session;
@@ -177,11 +178,6 @@ void app_record(app *a, change *c)
     history_push(a->history, c);
     if (replace)
         app_mark_set(a, history_state_id(a->history), s->foreign);
-}
-
-void app_push_patch(app *a, const img *before, irect r)
-{
-    app_record(a, change_patch(before, a->img, r));
 }
 
 /* A new picture replaced the old one as one undo step */
@@ -250,6 +246,7 @@ void app_load_image(app *a, img *im)
     a->live = NULL;
     img_free(a->img);
     a->img = im;
+    a->trim_ = 1;
     history_clear(a->history);
     a->saved_state = history_state_id(a->history);
     reset_view(a);
@@ -431,7 +428,7 @@ void app_commit_shape(app *a)
     if (!live)
         return;
     a->live = NULL;
-    app_push_patch(a, live->snapshot, live_shape_touched(live));
+    app_record(a, live_shape_change(live, a->img));
     live_shape_free(live);
 }
 
@@ -463,7 +460,7 @@ void app_text_box_free(text_box *t)
     if (!t)
         return;
     free(t->text);
-    img_free(t->snapshot);
+    snap_free(t->snapshot);
     mask_free(t->mask);
     text_cursor_free(&t->cursor);
     caret_layout_free(&t->layout);
@@ -482,6 +479,12 @@ static frect frect_xywh(float x, float y, float w, float h)
 {
     frect r = { x, y, x + w, y + h };
     return r;
+}
+
+/* Transparent text draws on a tile only where its mask has one */
+static int text_drawn_on(irect tile, void *user)
+{
+    return snap_mask_has(user, tile);
 }
 
 void app_update_text_preview(app *a)
@@ -526,7 +529,10 @@ void app_update_text_preview(app *a)
     if (opaque)
         r = irect_union(r, bg_rect);
     irect region = irect_union(tb->dirty, r);
-    raster_copy_rect(a->img, tb->snapshot, region);
+    snap_keep(tb->snapshot, a->img, r, opaque ? NULL : tb->mask);
+    snap_restore(tb->snapshot, a->img, region);
+    if (!opaque)
+        snap_drop(tb->snapshot, region, text_drawn_on, tb->mask);
     if (opaque)
         raster_fill_rect(a->img, bg_rect, bg);
     raster_blend_mask(a->img, tb->mask, fg, 1.0f, r);
@@ -547,7 +553,7 @@ void app_discard_text(app *a)
     if (!tb)
         return;
     a->text = NULL;
-    raster_copy_rect(a->img, tb->snapshot, tb->dirty);
+    snap_restore(tb->snapshot, a->img, tb->dirty);
     app_mark(a, tb->dirty);
     app_text_box_free(tb);
 }
@@ -561,11 +567,11 @@ void app_commit_text(app *a)
     a->text = NULL;
     if (blank_text(tb->text))
     {
-        raster_copy_rect(a->img, tb->snapshot, tb->dirty);
+        snap_restore(tb->snapshot, a->img, tb->dirty);
         app_mark(a, tb->dirty);
     }
     else
-        app_push_patch(a, tb->snapshot, tb->dirty);
+        app_record(a, snap_change(tb->snapshot, a->img, tb->dirty));
     app_text_box_free(tb);
 }
 
@@ -610,7 +616,7 @@ static void float_free(floating *f)
     if (!f)
         return;
     img_free(f->pixels);
-    img_free(f->base);
+    snap_free(f->base);
     img_free(f->before);
     img_free(f->lifted);
     patch_free(&f->hole);
@@ -633,19 +639,13 @@ static selection *selection_new(irect r)
     return s;
 }
 
-/* The canvas before the pixels were lifted (taken out of f) */
-static img *float_take_before(floating *f)
+/* Record the undo step from the canvas before the pixels were lifted to the picture now, within r
+ * (when the canvas size didn't change). f->base becomes that canvas: it's done with. */
+static void record_float(app *a, floating *f, irect r)
 {
-    img *b = f->before;
-    if (b)
-    {
-        f->before = NULL;
-        return b;
-    }
-    b = img_dup(f->base);
-    if (b && f->lifted)
-        raster_replace(b, f->lifted, f->origin.x0, f->origin.y0);
-    return b;
+    if (f->lifted || f->lifted_is_pixels)
+        snap_put(f->base, f->lifted ? f->lifted : f->pixels, f->origin.x0, f->origin.y0);
+    app_record(a, snap_change(f->base, a->img, r));
 }
 
 static mask *lasso_mask(const pt *poly, int n, int w, int h)
@@ -683,9 +683,18 @@ static void lift(app *a)
         return;
     rgba secondary = a->secondary;
     floating *f = calloc(1, sizeof *f);
+    f->base = snap_new(a->img);
+    if (!f->base)
+    {
+        free(f);
+        return;
+    }
     f->pixels = raster_crop(a->img, r);
-    f->base = img_dup(a->img);
-    f->lifted = img_crop(a->img, r.x0, r.y0, irect_w(r), irect_h(r));
+    /* A free-form selection's pixels outside the outline become transparent: keep them as they were */
+    f->lifted = sel->lasso ? img_crop(a->img, r.x0, r.y0, irect_w(r), irect_h(r)) : NULL;
+    f->lifted_is_pixels = !sel->lasso;
+    /* The canvas underneath differs from the picture only where the pixels were lifted (by tile) */
+    snap_keep(f->base, a->img, r, NULL);
     mask *inside = sel->lasso ? lasso_mask(sel->lasso, sel->n_lasso, irect_w(r), irect_h(r)) : NULL;
     if (inside)
     {
@@ -694,18 +703,24 @@ static void lift(app *a)
                 if (mask_get(inside, x, y) < 0.5f)
                     img_at(f->pixels, x, y)[3] = 0;
                 else
-                    memcpy(img_at(f->base, r.x0 + x, r.y0 + y), &secondary, 4);
+                    memcpy(snap_px(f->base, r.x0 + x, r.y0 + y), &secondary, 4);
     }
     else
-        raster_fill_rect(f->base, r, secondary);
-    /* Remember the lifted pixels, to redraw the hole if a friend draws under the selection */
+        snap_fill(f->base, r, secondary);
+    /* Drawing together, remember the lifted pixels, to redraw the hole if a friend draws under the selection */
     hole_ctx h = { a->img, inside, r };
-    f->has_hole = patch_build(r, hole_pick, &h, &f->hole);
+    f->has_hole = a->session && patch_build(r, hole_pick, &h, &f->hole);
     f->hole_color = secondary;
     mask_free(inside);
     f->origin = r;
     sel->rect = r;
     sel->fl = f;
+}
+
+static int float_covers(irect tile, void *user)
+{
+    const irect *keep = user;
+    return !irect_empty(irect_intersect(tile, keep[0])) || !irect_empty(irect_intersect(tile, keep[1]));
 }
 
 static void move_float_to(app *a, int x, int y)
@@ -716,9 +731,13 @@ static void move_float_to(app *a, int x, int y)
     floating *f = sel->fl;
     uint8_t key[3] = { a->secondary.r, a->secondary.g, a->secondary.b };
     irect old = sel->rect;
-    raster_copy_rect(a->img, f->base, old);
-    raster_blit_over(a->img, f->pixels, x, y, a->transparent_selection ? key : NULL);
+    snap_restore(f->base, a->img, old);
     sel->rect = irect_make(x, y, x + f->pixels->w, y + f->pixels->h);
+    /* The canvas underneath is kept apart from the picture only under the pixels and the hole */
+    irect keep[2] = { sel->rect, f->origin };
+    snap_drop(f->base, old, float_covers, keep);
+    snap_keep(f->base, a->img, sel->rect, NULL);
+    raster_blit_over(a->img, f->pixels, x, y, a->transparent_selection ? key : NULL);
     app_mark(a, irect_union(old, sel->rect));
 }
 
@@ -750,17 +769,13 @@ void app_commit_selection(app *a)
         return;
     a->sel = NULL;
     floating *f = sel->fl;
-    if (f)
+    if (f && f->canvas_changed)
     {
-        img *before = float_take_before(f);
-        if (f->canvas_changed)
-            app_record(a, change_replace(before, a->img));
-        else
-        {
-            app_push_patch(a, before, irect_union(f->origin, sel->rect));
-            img_free(before);
-        }
+        app_record(a, change_replace(f->before, a->img));
+        f->before = NULL;
     }
+    else if (f)
+        record_float(a, f, irect_union(f->origin, sel->rect));
     app_selection_free(sel);
 }
 
@@ -773,24 +788,30 @@ void app_delete_selection(app *a)
     floating *f = sel->fl;
     if (f)
     {
-        img *before = float_take_before(f);
-        img_free(a->img);
-        a->img = f->base;
-        f->base = NULL;
+        /* The picture becomes the canvas underneath */
+        snap_restore(f->base, a->img, irect_of(a->img));
         if (f->canvas_changed)
-            record_replace(a, before);
+        {
+            record_replace(a, f->before);
+            f->before = NULL;
+        }
         else
         {
             irect region = irect_union(f->origin, sel->rect);
             app_mark(a, region);
-            app_push_patch(a, before, region);
-            img_free(before);
+            record_float(a, f, region);
         }
     }
     else
     {
-        img *before = img_dup(a->img);
         irect r = sel->rect;
+        snap *before = snap_new(a->img);
+        if (!before)
+        {
+            app_selection_free(sel);
+            return;
+        }
+        snap_keep(before, a->img, r, NULL);
         if (sel->lasso)
         {
             mask *inside = lasso_mask(sel->lasso, sel->n_lasso, irect_w(r), irect_h(r));
@@ -804,8 +825,8 @@ void app_delete_selection(app *a)
         else
             raster_fill_rect(a->img, r, a->secondary);
         app_mark(a, r);
-        app_push_patch(a, before, r);
-        img_free(before);
+        app_record(a, snap_change(before, a->img, r));
+        snap_free(before);
     }
     app_selection_free(sel);
 }
@@ -883,12 +904,25 @@ void app_paste_image(app *a, img *pixels)
     x = x > 0 ? x : 0;
     y = y > 0 ? y : 0;
     floating *f = calloc(1, sizeof *f);
-    f->base = img_dup(a->img);
+    f->base = snap_new(a->img);
     f->before = before;
     f->origin = IRECT_EMPTY;
     f->canvas_changed = canvas_changed;
     f->pixels = pixels;
     uint8_t key[3] = { a->secondary.r, a->secondary.g, a->secondary.b };
+    if (!f->base)
+    {
+        if (before)
+        {
+            img_free(a->img);
+            a->img = before;
+            f->before = NULL;
+        }
+        float_free(f);
+        app_set_error(a, "Paint doesn't have enough memory to paste this picture.");
+        return;
+    }
+    snap_keep(f->base, a->img, irect_make(x, y, x + pw, y + ph), NULL);
     app_mark(a, raster_blit_over(a->img, pixels, x, y, a->transparent_selection ? key : NULL));
     app_selection_free(a->sel);
     a->sel = selection_new(irect_make(x, y, x + pw, y + ph));
@@ -900,7 +934,9 @@ void app_paste_image(app *a, img *pixels)
 
 void app_transform(app *a, img *(*f)(const img *src, void *user), void *user)
 {
+    /* A live shape is stamped first: what's under it is about to change */
     app_commit_text(a);
+    app_commit_shape(a);
     if (a->sel)
     {
         lift(a);
@@ -910,7 +946,10 @@ void app_transform(app *a, img *(*f)(const img *src, void *user), void *user)
         img *out = f(sel->fl->pixels, user);
         if (!out)
             return;
-        img_free(sel->fl->pixels);
+        if (sel->fl->lifted_is_pixels)
+            sel->fl->lifted = sel->fl->pixels, sel->fl->lifted_is_pixels = 0;
+        else
+            img_free(sel->fl->pixels);
         sel->fl->pixels = out;
         free(sel->lasso);
         sel->lasso = NULL;
@@ -976,15 +1015,36 @@ void app_crop(app *a)
     a->scroll_x = a->scroll_y = 0.0f;
 }
 
+/* The picture's rows before Clear image, and a row of Color 2 after it */
+typedef struct
+{
+    const img *im;
+    uint8_t *row;
+} clear_rows;
+
+static const uint8_t *picture_row(int y, void *user)
+{
+    return img_at(((clear_rows *)user)->im, 0, y);
+}
+
+static const uint8_t *color2_row(int y, void *user)
+{
+    return ((clear_rows *)user)->row;
+}
+
 void app_clear_image(app *a)
 {
     app_commit_all(a);
-    img *before = img_dup(a->img);
     irect all = irect_of(a->img);
+    /* The undo step is packed from the rows, then the picture is cleared */
+    clear_rows rows = { a->img, malloc((size_t)a->img->w * 4 + 4) };
+    for (int x = 0; rows.row && x < a->img->w; x++)
+        memcpy(rows.row + (size_t)x * 4, &a->secondary, 4);
+    change *c = rows.row ? change_patch_rows(all, picture_row, color2_row, &rows) : NULL;
+    free(rows.row);
     raster_fill_rect(a->img, all, a->secondary);
     app_mark(a, all);
-    app_push_patch(a, before, all);
-    img_free(before);
+    app_record(a, c);
 }
 
 /* The canvas grows or shrinks to w x h (new area Color 2), as one undo step */
@@ -1278,7 +1338,7 @@ void app_canvas_size(const app *a, int *w, int *h)
 
 void app_op_clear(app *a)
 {
-    img_free(a->op.snapshot);
+    snap_free(a->op.snapshot);
     mask_free(a->op.mask);
     free(a->op.lasso);
     memset(&a->op, 0, sizeof a->op);
@@ -1317,7 +1377,8 @@ static void stroke_to(app *a, const pt *pts, int n, int first)
     }
     if (irect_empty(r))
         return;
-    raster_copy_rect(a->img, op->snapshot, r);
+    snap_keep(op->snapshot, a->img, r, op->mask);
+    snap_restore(op->snapshot, a->img, r);
     raster_blend_mask(a->img, op->mask, op->color, op->opacity, r);
     op->dirty = irect_union(op->dirty, r);
     app_mark(a, r);
@@ -1331,10 +1392,32 @@ void app_spray_frame(app *a, float dt)
         return;
     int n = (int)clampf(op->size * op->size * 0.12f * dt * 60.0f, 2.0f, 2000.0f);
     irect r = brush_spray(op->mask, op->last, op->size, &a->rng, n);
-    raster_copy_rect(a->img, op->snapshot, r);
+    snap_keep(op->snapshot, a->img, r, op->mask);
+    snap_restore(op->snapshot, a->img, r);
     raster_blend_mask(a->img, op->mask, op->color, op->opacity, r);
     op->dirty = irect_union(op->dirty, r);
     app_mark(a, r);
+}
+
+/* A fill's rows, before and after it, for its undo step */
+typedef struct
+{
+    const fill_plan *fp;
+    const img *im;
+    uint8_t *row;
+} fill_rows;
+
+static const uint8_t *fill_before(int y, void *user)
+{
+    fill_rows *f = user;
+    return img_at(f->im, f->fp->r.x0, y);
+}
+
+static const uint8_t *fill_after(int y, void *user)
+{
+    fill_rows *f = user;
+    raster_fill_row(f->fp, f->im, y, f->row);
+    return f->row;
 }
 
 void app_begin(app *a, pt p, int button, pt anchor)
@@ -1373,7 +1456,7 @@ void app_begin(app *a, pt p, int button, pt anchor)
             op->opacity = brush_opacity(a->brush);
             op->size = a->size_brush;
         }
-        op->snapshot = img_dup(a->img);
+        op->snapshot = snap_new(a->img);
         op->mask = mask_new(w, h);
         if (!op->snapshot || !op->mask)
         {
@@ -1393,12 +1476,18 @@ void app_begin(app *a, pt p, int button, pt anchor)
         if (!inside)
             return;
         app_commit_all(a);
-        img *before = img_dup(a->img);
         uint8_t tolerance = (uint8_t)roundf(a->fill_tolerance / 100.0f * 255.0f);
-        irect r = raster_flood_fill(a->img, (int)p.x, (int)p.y, c1, tolerance);
-        app_mark(a, r);
-        app_push_patch(a, before, r);
-        img_free(before);
+        fill_plan fp;
+        if (!raster_fill_plan(a->img, (int)p.x, (int)p.y, c1, tolerance, &fp))
+            break;
+        /* The undo step is packed from the rows before and after, then the fill is done */
+        fill_rows rows = { &fp, a->img, malloc((size_t)irect_w(fp.r) * 4) };
+        change *c = rows.row ? change_patch_rows(fp.r, fill_before, fill_after, &rows) : NULL;
+        free(rows.row);
+        raster_fill_apply(&fp, a->img);
+        app_mark(a, fp.r);
+        app_record(a, c);
+        raster_fill_free(&fp);
         break;
     }
     case TOOL_PICKER:
@@ -1451,7 +1540,7 @@ void app_begin(app *a, pt p, int button, pt anchor)
         tb->pos = pt_make(floorf(p.x), floorf(p.y));
         tb->text = dup_str("");
         tb->preedit = dup_str("");
-        tb->snapshot = img_dup(a->img);
+        tb->snapshot = snap_new(a->img);
         tb->mask = mask_new(w, h);
         tb->dirty = IRECT_EMPTY;
         tb->bounds = frect_xywh(p.x, p.y, 0, 0);
@@ -1488,7 +1577,7 @@ void app_begin(app *a, pt p, int button, pt anchor)
         }
         /* Clicking away from the live shape stamps it and starts a new one */
         app_commit_all(a);
-        a->live = live_shape_new(a->shape, p, secondary, img_dup(a->img));
+        a->live = live_shape_over(a->shape, p, secondary, a->img);
         if (!a->live)
         {
             app_set_error(a, "Paint doesn't have enough memory to draw.");
@@ -1609,7 +1698,7 @@ void app_end(app *a)
     switch (op->kind)
     {
     case OP_STROKE:
-        app_push_patch(a, op->snapshot, op->dirty);
+        app_record(a, snap_change(op->snapshot, a->img, op->dirty));
         break;
     case OP_SHAPE_CREATE:
         /* A click without a drag draws nothing */

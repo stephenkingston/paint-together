@@ -128,5 +128,8 @@ void gfx_img(surface *dst, int x, int y, const img *im);
 void gfx_canvas(surface *dst, rect to, const img *im, double sx, double sy, double zoom);
 /* The checkerboard's square in screen pixels (8 at 100%: theme sets it with the scale) */
 void gfx_canvas_checker(int cell);
+/* For the next gfx_canvas only: a picture of the same size whose pixels that aren't
+ * fully transparent are shown instead of the picture's (friends' drawing in progress) */
+void gfx_canvas_over(const img *over);
 
 #endif

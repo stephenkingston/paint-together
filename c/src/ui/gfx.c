@@ -940,9 +940,16 @@ static int checker_cell = 8;
 static int *cols;       /* per screen column: first source column (and count, stride when zoomed out) */
 static int cap_cols;
 
+static const img *canvas_over;
+
 void gfx_canvas_checker(int cell)
 {
     checker_cell = cell < 1 ? 1 : cell;
+}
+
+void gfx_canvas_over(const img *over)
+{
+    canvas_over = over;
 }
 
 static inline int checker_at(int x, int y, int ax, int ay)
@@ -970,6 +977,9 @@ static void source_span(double s, double zoom, int i, int limit, int *first, int
 
 void gfx_canvas(surface *dst, rect to, const img *im, double sx, double sy, double zoom)
 {
+    /* The overlay's pixel stands in for the picture's at the same offset */
+    const img *ov = canvas_over && canvas_over->w == im->w && canvas_over->h == im->h ? canvas_over : NULL;
+    canvas_over = NULL;
     rect v = rect_cut(to, dst->clip);
     if (rect_empty(v) || im->w < 1 || im->h < 1 || !(zoom > 0))
         return;
@@ -1009,6 +1019,8 @@ void gfx_canvas(surface *dst, rect to, const img *im, double sx, double sy, doub
                 if (cols[i] < 0)
                     continue;
                 const uint8_t *s = row + (size_t)cols[i] * 4;
+                if (ov && ov->px[s - im->px + 3])
+                    s = ov->px + (s - im->px);
                 if (s[3] == 255)
                     p[i] = 0xFF000000u | (uint32_t)s[0] << 16 | (uint32_t)s[1] << 8 | s[2];
                 else
@@ -1047,6 +1059,8 @@ void gfx_canvas(surface *dst, rect to, const img *im, double sx, double sy, doub
                 for (int k = 0; k < cx; k++)
                 {
                     const uint8_t *s = row + (size_t)(c0 + k * cn / cx) * 4;
+                    if (ov && ov->px[s - im->px + 3])
+                        s = ov->px + (s - im->px);
                     sr += s[0] * s[3];
                     sg += s[1] * s[3];
                     sb += s[2] * s[3];

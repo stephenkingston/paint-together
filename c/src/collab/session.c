@@ -95,6 +95,7 @@ static void map_clear(tile_map *m)
 }
 
 /* ---- the session ---- */
+static region rebuild(session *s, region g);
 static void free_pending(session *s)
 {
     for (int i = 0; i < s->n_pending_; i++)
@@ -155,14 +156,64 @@ static void drop_overlay_if_unused(session *s)
     }
 }
 
+/* ---- `confirmed`, whole or by tile ---- */
+
+/* Keep `confirmed` whole from now on */
+static void confirmed_whole(session *s)
+{
+    if (s->confirmed_ || !(s->confirmed_ = img_dup(s->base)))
+        return;
+    snap_restore(s->under_, s->confirmed_, irect_of(s->base));
+    snap_free(s->under_);
+    s->under_ = NULL;
+}
+
+/* With none of my edits unconfirmed, `confirmed` is `base`: keep no pixels of its own */
+static void confirmed_settle(session *s)
+{
+    if (s->n_pending_ || (!s->confirmed_ && !s->under_->n_kept)
+        || (s->confirmed_ && (!same_size(s->confirmed_, s->base) || memcmp(s->confirmed_->px, s->base->px, (size_t)s->base->w * s->base->h * 4))))
+        return;
+    snap *u = snap_new(s->base);
+    if (!u)
+        return;
+    snap_free(s->under_);
+    s->under_ = u;
+    img_free(s->confirmed_);
+    s->confirmed_ = NULL;
+}
+
+/* My edit is about to change `base` in g: keep `confirmed`'s pixels there */
+static void confirmed_keep(session *s, region g)
+{
+    if (s->confirmed_)
+        return;
+    if (g.whole)
+        confirmed_whole(s);
+    else
+        snap_keep(s->under_, s->base, g.r, NULL);
+}
+
+/* Start from `picture` as `base` and `confirmed`, then my unconfirmed edits on top */
+static void start_from(session *s, img *picture)
+{
+    img_free(s->confirmed_);
+    img_free(s->base);
+    snap_free(s->under_);
+    s->confirmed_ = NULL;
+    s->base = picture;
+    s->under_ = snap_new(picture);
+    if (!s->under_)
+        confirmed_whole(s);
+}
+
 session *session_new(peer_id me, peer_id host, uint64_t seq, img *picture, kid_list kids)
 {
     session *s = calloc(1, sizeof *s);
     s->me = me;
     s->host = host;
     s->kids = kids;
-    s->confirmed_ = picture;
-    s->base = img_dup(picture);
+    start_from(s, picture);
     s->seq_ = seq;
     s->next_id_ = 1;
     clear_previews(s);
@@ -178,6 +229,7 @@ void session_free(session *s)
     kid_list_free(&s->waiting);
     img_free(s->base);
     img_free(s->confirmed_);
+    snap_free(s->under_);
     free_pending(s);
     free_outbox(s);
     map_clear(&s->sent_);
@@ -193,13 +245,11 @@ void session_rejoin(session *s, peer_id me, peer_id host, uint64_t seq, img *pic
     kid_list_free(&s->kids);
     s->kids = kids;
     kid_list_free(&s->waiting);
-    img_free(s->confirmed_);
-    s->confirmed_ = picture;
-    img_free(s->base);
-    s->base = img_dup(picture);
+    start_from(s, picture);
     free_outbox(s);
     for (int i = 0; i < s->n_pending_; i++)
     {
+        confirmed_keep(s, edit_region(&s->pending_[i].e, s->base));
         edit_apply(&s->pending_[i].e, &s->base);
         to_hub m = { 0 };
         m.kind = TO_EDIT;
@@ -327,7 +377,10 @@ int session_presence(session *s, presence p, to_hub *out)
 
 const img *session_confirmed(const session *s)
 {
-    return s->confirmed_;
+    /* Rarely asked for with edits of mine on their way (a new host starting from it) */
+    if (!s->confirmed_ && s->n_pending_)
+        confirmed_whole((session *)s);
+    return s->confirmed_ ? s->confirmed_ : s->base;
 }
 
 int session_unconfirmed(const session *s)
@@ -337,6 +390,7 @@ int session_unconfirmed(const session *s)
 
 void session_commit(session *s, edit e)
 {
+    confirmed_keep(s, edit_region(&e, s->base));
     edit_apply(&e, &s->base);
     to_hub m = { 0 };
     m.kind = TO_EDIT;
@@ -380,6 +434,28 @@ static int has_kid(const kid_list *l, peer_id id)
         if (l->v[i].id == id)
             return 1;
     return 0;
+}
+
+/* An edit the hub put in order: `confirmed` takes it, and `base` is `confirmed` with my
+ * unconfirmed edits on top again where it changed (all of it, for a whole-picture edit) */
+static region take_in(session *s, const edit *e)
+{
+    if (e->kind != EDIT_PATCH)
+        confirmed_whole(s);
+    region g = edit_region(e, s->confirmed_ ? s->confirmed_ : s->base);
+    if (s->confirmed_)
+    {
+        edit_apply(e, &s->confirmed_);
+        return rebuild(s, g);
+    }
+    /* By tile: `base` there becomes `confirmed`, takes the edit, and that is kept as `confirmed`;
+     * outside the kept tiles `base` was `confirmed` all along */
+    snap_restore(s->under_, s->base, g.r);
+    edit_apply(e, &s->base);
+    snap_rebase(s->under_, s->base, g.r);
+    for (int i = 0; i < s->n_pending_; i++)
+        patch_apply_within(&s->pending_[i].e.p, s->base, g.r);
+    return g;
 }
 
 /* Recompute `base` where `confirmed` changed, keeping my unconfirmed edits on top */
@@ -484,20 +560,24 @@ received session_receive(session *s, from_hub *msg)
     {
         s->seq_ = msg->seq;
         int mine = msg->from == s->me && s->n_pending_ && s->pending_[0].id == msg->id;
-        region g = edit_region(&msg->edit, s->confirmed_);
-        edit_apply(&msg->edit, &s->confirmed_);
         if (mine)
         {
             /* Already part of `base` and the screen */
             edit_free(&s->pending_[0].e);
             memmove(&s->pending_[0], &s->pending_[1], sizeof(pending_edit) * (size_t)(s->n_pending_ - 1));
             s->n_pending_--;
+            if (s->confirmed_)
+                edit_apply(&msg->edit, &s->confirmed_);
+            else if (s->n_pending_)
+                take_in(s, &msg->edit);
+            confirmed_settle(s);
             break;
         }
         s->foreign++;
         s->version++;
         drop_preview(s, msg->from);
-        g = rebuild(s, g);
+        region g = take_in(s, &msg->edit);
+        confirmed_settle(s);
         if (g.whole && !overlay_fits(s))
         {
             clear_previews(s);

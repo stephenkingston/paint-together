@@ -159,7 +159,8 @@ static void admit(hub *h, kid k, hub_out *out)
     w.you = id;
     w.host = h->host;
     w.seq = h->seq;
-    w.picture = picture_of(h->picture);
+    /* Lent, not copied: it is sent (or copied for my own app) before the hub changes it */
+    w.picture = (picture){ (uint32_t)h->picture->w, (uint32_t)h->picture->h, h->picture->px, (size_t)h->picture->w * h->picture->h * 4, 1 };
     w.yes = h->ask_first;
     hub_out_push(out, TO_ONE, id, w);
     hub_out_push(out, TO_OTHERS, id, kids_msg(FROM_KIDS, &h->kids));

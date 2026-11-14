@@ -15,7 +15,6 @@ static inline int app_busy_dialog(const app *a)
 /* app.c */
 void app_mark(app *a, irect r);
 void app_record(app *a, change *c);                 /* a finished edit: one undo step, and sent to friends */
-void app_push_patch(app *a, const img *before, irect r);
 void app_set_error(app *a, const char *fmt, ...);
 void pending_set(pending *p, int kind, const char *arg);
 void pending_clear(pending *p);

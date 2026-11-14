@@ -161,8 +161,8 @@ static void history_round_trips_patches_and_replacements(void)
     CHECK(!history_undo(h, &im), "nothing more to undo");
     CHECK(history_redo(h, &im), "redo");
     CHECK(same(im, after_patch), "redo picture");
-    CHECK(history_state_id(h) == 1 && history_redo_id(h) == 2, "ids %llu %llu", (unsigned long long)history_state_id(h),
-          (unsigned long long)history_redo_id(h));
+    CHECK(history_state_id(h) == 1 && history_redo_id(h) == 2, "ids %lu %lu", (unsigned long)history_state_id(h),
+          (unsigned long)history_redo_id(h));
     /* Identical before/after is not recorded. */
     CHECK(change_patch(original, original, irect_make(0, 0, 16, 16)) == NULL, "empty patch");
     history_free(h);

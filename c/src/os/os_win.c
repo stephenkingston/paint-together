@@ -526,6 +526,39 @@ char *os_read_file(const char *path, size_t *len)
     return buf;
 }
 
+void os_trim(void)
+{
+}
+
+const void *os_map_file(const char *path, size_t *len)
+{
+    wchar_t *w = wide(path);
+    HANDLE f = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    free(w);
+    if (f == INVALID_HANDLE_VALUE)
+        return NULL;
+    LARGE_INTEGER size;
+    HANDLE m = NULL;
+    void *p = NULL;
+    if (GetFileSizeEx(f, &size) && size.QuadPart > 0 && (uint64_t)size.QuadPart <= SIZE_MAX)
+        m = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (m)
+    {
+        p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(m);
+    }
+    CloseHandle(f);
+    if (p)
+        *len = (size_t)size.QuadPart;
+    return p;
+}
+
+void os_unmap_file(const void *data, size_t len)
+{
+    if (data)
+        UnmapViewOfFile(data);
+}
+
 int os_write_file(const char *path, const void *data, size_t len)
 {
     size_t plen = strlen(path);

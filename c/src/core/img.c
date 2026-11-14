@@ -1,7 +1,7 @@
 /*
  * Paint (C port) - RGBA pictures, picture files and raw deflate (Rust: raster::IRect, the image crate, flate2)
  *
- * stb_image reads PNG, JPEG, BMP, GIF, TGA and PNM; small readers here do ICO
+ * stb_image reads PNG, JPEG, BMP and GIF; small readers here do ICO
  * (PNG or BMP entries, the largest wins) and baseline TIFF. stb_image_write
  * writes PNG, JPEG and BMP; GIF and TIFF writers are here. Saving does what
  * the Rust app does through the image crate: JPEG and BMP drop the alpha
@@ -87,7 +87,10 @@ img *img_new(int w, int h, rgba fill)
         return NULL;
     img *im = malloc(sizeof *im);
     size_t n = (size_t)w * h;
-    uint8_t *px = malloc(n * 4 + 4);
+    /* Transparent: a big picture comes zeroed from the system, its pages taking memory only once written
+     * (a friends' drawing overlay, mostly empty, stays small) */
+    int clear = !fill.r && !fill.g && !fill.b && !fill.a;
+    uint8_t *px = clear ? calloc(n * 4 + 4, 1) : malloc(n * 4 + 4);
     if (!im || !px)
     {
         free(im);
@@ -97,9 +100,9 @@ img *img_new(int w, int h, rgba fill)
     im->w = w;
     im->h = h;
     im->px = px;
-    if (fill.r == fill.g && fill.g == fill.b && fill.b == fill.a)
+    if (!clear && fill.r == fill.g && fill.g == fill.b && fill.b == fill.a)
         memset(px, fill.r, n * 4);
-    else
+    else if (!clear)
         for (size_t i = 0; i < n; i++)
             memcpy(px + i * 4, &fill, 4);
     return im;
@@ -653,14 +656,17 @@ img *img_load(const char *path, const char **err)
     const char *dummy;
     if (!err)
         err = &dummy;
+    /* Mapped, the file costs no memory of ours while it is decoded */
     size_t len;
-    char *data = os_read_file(path, &len);
-    if (!data)
+    const void *map = os_map_file(path, &len);
+    char *data = map ? NULL : os_read_file(path, &len);
+    if (!map && !data)
     {
         *err = "The file can't be read.";
         return NULL;
     }
-    img *im = img_load_mem(data, len, err);
+    img *im = img_load_mem(map ? map : data, len, err);
+    os_unmap_file(map, len);
     free(data);
     return im;
 }

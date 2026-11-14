@@ -127,6 +127,7 @@ from_hub from_hub_clone(const from_hub *m)
 {
     from_hub c = *m;
     c.picture.rgba = NULL;
+    c.picture.borrowed = 0;
     if (m->picture.len)
         c.picture.rgba = memcpy(malloc(m->picture.len), m->picture.rgba, m->picture.len);
     c.kids = kid_list_clone(&m->kids);

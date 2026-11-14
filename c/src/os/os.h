@@ -83,6 +83,10 @@ int os_local_ips(uint32_t *out, int cap);
 
 /* ---- files and paths ---- */
 char *os_read_file(const char *path, size_t *len);          /* malloc'd (and NUL-terminated), or NULL */
+/* A file mapped read-only: its pages are read on demand and shared with the system's
+ * file cache, so they cost no memory of the program's own. NULL if it can't be (or is empty). */
+const void *os_map_file(const char *path, size_t *len);
+void os_unmap_file(const void *data, size_t len);
 int os_write_file(const char *path, const void *data, size_t len);  /* 0 ok; written to a temp file, then renamed */
 int os_file_size(const char *path, int64_t *size, int64_t *mtime_secs);   /* 0 ok */
 int os_mkdirs(const char *path);                            /* 0 ok (also when it exists) */
@@ -101,6 +105,8 @@ const char *os_path_base(const char *path);                 /* the part after th
  * status. argv[0] is looked up on PATH. Returns NULL if it could not be started. */
 char *os_run_capture(char *const argv[], int *status);
 int os_getpid(void);
+/* Hand freed memory inside the heap back to the system (glibc; elsewhere the allocator does) */
+void os_trim(void);
 /* Random bytes from the OS (falls back to a time-seeded generator) */
 void os_random(void *out, size_t len);
 

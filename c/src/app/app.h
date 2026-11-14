@@ -126,7 +126,7 @@ typedef struct
     /* OP_STROKE */
     int pen;            /* PEN_* */
     brush_kind brush;
-    img *snapshot;      /* the picture when the stroke began */
+    snap *snapshot;     /* the picture when the stroke began (where it has drawn) */
     mask *mask;
     rgba color;
     float opacity, size;
@@ -151,14 +151,15 @@ typedef struct
 typedef struct
 {
     img *pixels;
-    img *base;          /* the canvas underneath (the lifted area filled with Color 2) */
+    snap *base;         /* the canvas underneath (the lifted area filled with Color 2), where it isn't the picture's */
     /* The canvas before the pixels were lifted, for undo. Outside `origin` it is
      * `base`, so only its pixels inside `origin` are kept (`lifted`), unless
      * pasting enlarged the canvas: then all of it (`before`). */
     img *before;
     img *lifted;
+    int lifted_is_pixels;   /* `lifted` is NULL: `pixels` are still those pixels, unchanged */
     irect origin;       /* where the pixels were lifted from; empty for pastes */
-    int has_hole;       /* the lifted pixels as they were then, and the Color 2 left behind */
+    int has_hole;       /* drawing together: the lifted pixels as they were then, and the Color 2 left behind */
     patch hole;
     rgba hole_color;
     int canvas_changed; /* pasting enlarged the canvas */
@@ -176,7 +177,7 @@ typedef struct
 {
     pt pos;
     char *text;         /* UTF-8 */
-    img *snapshot;
+    snap *snapshot;     /* the picture under the box (where it has drawn) */
     mask *mask;
     irect dirty;
     frect bounds;       /* in picture pixels */
@@ -337,6 +338,7 @@ typedef struct app
 
     /* private */
     char last_text_[16];    /* the text typed since the last key went down (an IME may commit it again) */
+    int trim_;              /* an operation ended: hand what it freed back to the system */
     double last_spray_;
     int right_menu_;        /* a right press with a selection tool, waiting for its release */
     int has_last_pt_;       /* the pointer during a drag, in picture pixels */

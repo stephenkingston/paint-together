@@ -177,29 +177,41 @@ static const uint8_t *unpack_row(const uint8_t *s, uint8_t *row, int w)
     return s;
 }
 
-/* Pack the rows of r in im (against the same rows of rr in ref, if given) into a buffer that fits;
- * it starts at the worst case, given back once the size is known */
-static uint8_t *pack_side(const img *im, irect r, const img *ref, irect rr, int *delta, size_t *len)
+/* Rows of a picture, from column x0 (the row source the packing reads) */
+typedef struct
 {
-    int w = irect_w(r), h = irect_h(r);
+    const img *im;
+    int x0;
+} img_rows;
+
+static const uint8_t *img_row(int y, void *user)
+{
+    const img_rows *s = user;
+    return img_at(s->im, s->x0, y);
+}
+
+/* Pack rows y0.. of w pixels (against the same rows of ref, if given) into a buffer that fits;
+ * it starts at the worst case, given back once the size is known */
+static uint8_t *pack_side(int w, int y0, int h, change_row_fn row, void *ru, change_row_fn ref, void *fu, int *delta, size_t *len)
+{
     uint8_t *buf = malloc((size_t)h * ((size_t)w * 4 + 5) + 1), *o = buf;
     if (!buf)
         return NULL;
     for (int j = 0; j < h; j++)
-        o = pack_row(o, img_at(im, r.x0, r.y0 + j), ref ? img_at(ref, rr.x0, rr.y0 + j) : NULL, w, delta);
+        o = pack_row(o, row(y0 + j, ru), ref ? ref(y0 + j, fu) : NULL, w, delta);
     *len = (size_t)(o - buf);
     uint8_t *fit = realloc(buf, *len + 1);
     return fit ? fit : buf;
 }
 
-/* rb of b before, ra of a after (packed against b when the sizes match) */
-static change *pack_change(int kind, int x, int y, const img *b, irect rb, const img *a, irect ra)
+/* rb of the before rows, ra of the after rows (packed against the before rows when the sizes match) */
+static change *pack_change(int kind, int x, int y, irect rb, change_row_fn bf, void *bu, irect ra, change_row_fn af, void *au)
 {
     int bw = irect_w(rb), bh = irect_h(rb), aw = irect_w(ra), ah = irect_h(ra), delta = 0;
     size_t blen = 0, alen = 0;
     change *c = calloc(1, sizeof *c);
-    uint8_t *pb = c ? pack_side(b, rb, NULL, rb, &delta, &blen) : NULL;
-    uint8_t *pa = pb ? pack_side(a, ra, bw == aw && bh == ah ? b : NULL, rb, &delta, &alen) : NULL;
+    uint8_t *pb = c ? pack_side(bw, rb.y0, bh, bf, bu, NULL, NULL, &delta, &blen) : NULL;
+    uint8_t *pa = pb ? pack_side(aw, ra.y0, ah, af, au, bw == aw && bh == ah ? bf : NULL, bu, &delta, &alen) : NULL;
     if (!pa)
     {
         free(pb);
@@ -210,9 +222,20 @@ static change *pack_change(int kind, int x, int y, const img *b, irect rb, const
     return c;
 }
 
+change *change_patch_rows(irect r, change_row_fn before, change_row_fn after, void *user)
+{
+    if (irect_empty(r))
+        return NULL;
+    int same = 1;
+    for (int y = r.y0; y < r.y1 && same; y++)
+        same = !memcmp(before(y, user), after(y, user), (size_t)irect_w(r) * 4);
+    return same ? NULL : pack_change(CHANGE_PATCH, r.x0, r.y0, r, before, user, r, after, user);
+}
+
 change *change_patch(const img *before, const img *after, irect r)
 {
     r = irect_intersect(irect_intersect(r, irect_of(before)), irect_of(after));
+    img_rows b = { before, r.x0 }, a = { after, r.x0 };
     if (irect_empty(r))
         return NULL;
     int same = 1;
@@ -220,12 +243,13 @@ change *change_patch(const img *before, const img *after, irect r)
         same = !memcmp(img_at(before, r.x0, y), img_at(after, r.x0, y), (size_t)irect_w(r) * 4);
     if (same)
         return NULL;
-    return pack_change(CHANGE_PATCH, r.x0, r.y0, before, r, after, r);
+    return pack_change(CHANGE_PATCH, r.x0, r.y0, r, img_row, &b, r, img_row, &a);
 }
 
 change *change_replace(img *before, const img *after)
 {
-    change *c = pack_change(CHANGE_REPLACE, 0, 0, before, irect_of(before), after, irect_of(after));
+    img_rows b = { before, 0 }, a = { after, 0 };
+    change *c = pack_change(CHANGE_REPLACE, 0, 0, irect_of(before), img_row, &b, irect_of(after), img_row, &a);
     img_free(before);
     return c;
 }

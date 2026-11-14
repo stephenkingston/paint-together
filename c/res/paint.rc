@@ -1,6 +1,6 @@
 /*
  * Paint (C port) - the Windows resources: the manifest, version information
- * and the icon (res/paint.ico, which the Makefile draws from the logo)
+ * and the icon (paint.ico, which the Makefile draws from the logo into the build folder)
  *
  * The window's icon is drawn at run time and set with WM_SETICON; the .ico
  * is only for Explorer and the taskbar before the program starts.

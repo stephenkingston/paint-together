@@ -122,6 +122,26 @@ irect raster_blit_over(img *dst, const img *src, int x, int y, const uint8_t *ke
  * all lie within tolerance of the seed colour are replaced; then the blended
  * pixels of anti-aliased edges around the region are re-mixed with the new colour. */
 irect raster_flood_fill(img *im, int x, int y, rgba color, uint8_t tolerance);
+/* The same in steps, so the picture before it needn't be copied for undo: work it out
+ * (0 if it does nothing), then read its rows (y within r) or do it, and free it */
+typedef struct
+{
+    int x, y;
+    rgba c;
+} fill_px;
+typedef struct
+{
+    irect r;            /* the pixels it changes */
+    rgba color;
+    int w;
+    uint8_t *filled;    /* a bit per picture pixel (row y, column x: bit y * w + x) */
+    fill_px *edges;     /* the re-mixed edge pixels, by row */
+    size_t n_edges;
+} fill_plan;
+int raster_fill_plan(const img *im, int x, int y, rgba color, uint8_t tolerance, fill_plan *fp);
+void raster_fill_row(const fill_plan *fp, const img *im, int y, uint8_t *out);    /* row y of r, filled */
+void raster_fill_apply(const fill_plan *fp, img *im);
+void raster_fill_free(fill_plan *fp);
 /* A w x h canvas holding im at the top-left, padded with fill */
 img *raster_resize_canvas(const img *im, int w, int h, rgba fill);
 img *raster_invert(const img *im);

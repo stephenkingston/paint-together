@@ -33,6 +33,10 @@ typedef struct
 
 /* The difference between two same-sized pictures within r, or NULL if nothing changed */
 change *change_patch(const img *before, const img *after, irect r);
+/* The same from rows handed out by callbacks (for a picture before that isn't kept whole): row y of the
+ * picture, from r.x0. A row from one callback must stay valid during a call to the other. */
+typedef const uint8_t *(*change_row_fn)(int y, void *user);
+change *change_patch_rows(irect r, change_row_fn before, change_row_fn after, void *user);
 change *change_replace(img *before, const img *after);    /* takes ownership of before */
 void change_free(change *c);
 void change_apply(const change *c, img **picture, int undo);  /* may replace *picture (CHANGE_REPLACE) */

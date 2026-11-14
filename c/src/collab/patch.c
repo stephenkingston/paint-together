@@ -15,7 +15,8 @@ void patch_free(patch *p)
 
 void picture_free(picture *pic)
 {
-    free(pic->rgba);
+    if (!pic->borrowed)
+        free(pic->rgba);
     memset(pic, 0, sizeof *pic);
 }
 
@@ -47,6 +48,7 @@ edit edit_clone(const edit *e)
 {
     edit c = { e->kind, patch_clone(&e->p), e->pic };
     c.pic.rgba = dup_bytes(e->pic.rgba, e->pic.len);
+    c.pic.borrowed = 0;
     return c;
 }
 
@@ -63,13 +65,6 @@ int picture_valid(const picture *pic)
            && (uint64_t)pic->len == (uint64_t)pic->w * pic->h * 4;
 }
 
-picture picture_of(const img *im)
-{
-    size_t len = (size_t)im->w * im->h * 4;
-    picture pic = { (uint32_t)im->w, (uint32_t)im->h, dup_bytes(im->px, len), len };
-    return pic;
-}
-
 img *picture_to_image(const picture *pic)
 {
     if (!picture_valid(pic))
@@ -77,6 +72,23 @@ img *picture_to_image(const picture *pic)
     img *im = img_new((int)pic->w, (int)pic->h, (rgba){ 0, 0, 0, 0 });
     if (im)
         memcpy(im->px, pic->rgba, pic->len);
+    return im;
+}
+
+img *picture_take(picture *pic)
+{
+    if (!picture_valid(pic))
+        return NULL;
+    /* The pixels become the picture's (with the slack img_new leaves at the end) */
+    uint8_t *px = realloc(pic->rgba, pic->len + 4);
+    if (!px)
+        return picture_to_image(pic);
+    pic->rgba = px;
+    img *im = malloc(sizeof *im);
+    if (!im)
+        return NULL;
+    *im = (img){ (int)pic->w, (int)pic->h, px };
+    memset(pic, 0, sizeof *pic);
     return im;
 }
 
