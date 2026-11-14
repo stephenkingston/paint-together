@@ -497,8 +497,7 @@ static void selection_menu(app *a)
     if (rb_menu_item(ICON_DELETE, 0, "Delete", 0, has_sel).clicked)
         app_delete_selection(a), kit_popup_close();
     kit_separator();
-    kit_resp rotate = rb_menu_item(-1, 0, "Rotate  \xE2\x96\xB8", 0, 1);
-    if (kit_popup_menu(&rotate, 200, 0))
+    if (kit_submenu("      Rotate", 200))
     {
         view_rotate_items(a);
         kit_popup_end();
@@ -556,6 +555,7 @@ void view_canvas(app *a, rect full)
     /* The scroll bars take room from the view when the picture doesn't fit */
     app_set_view(a, panel);
     float cw, ch;
+    a->view.w = a->view.h = 0;      /* the picture's own size, not stretched to the panel */
     app_content_size(a, &cw, &ch);
     int bar_h = cw > panel.w, bar_v = ch > panel.h - (bar_h ? bw : 0);
     bar_h = cw > panel.w - (bar_v ? bw : 0);

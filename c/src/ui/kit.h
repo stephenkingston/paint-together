@@ -17,8 +17,8 @@
  *
  * Layers: popups, menus and dialogs are drawn into their own small
  * surfaces while the app builds them (wherever in the frame that is) and
- * put on top of the window, in the order opened, by kit_end; the tooltip
- * goes last. kit_dst() is the surface the current layer draws into: draw
+ * put on top of the window, in the order opened, by kit_end; then
+ * kit_on_top's painting (the toasts), and the tooltip last. kit_dst() is the surface the current layer draws into: draw
  * custom things there, never into the window's surface directly. The
  * topmost layer under the pointer (as of the previous frame) gets the
  * pointer; a modal dialog blocks everything below it.
@@ -122,6 +122,7 @@ typedef struct
 } kit_resp;
 kit_resp kit_interact(rect r, kit_id id, int sense);
 kit_resp kit_interact_off(rect r, kit_id id, int sense, int enabled);
+const kit_resp *kit_last(void);             /* the last widget's response (for a check box's or text field's tooltip) */
 void kit_focus(kit_id id);                  /* give a widget the keyboard focus (0: nobody) */
 kit_id kit_focused(void);
 /* A tooltip for the widget, shown after the pointer rests on it */
@@ -187,10 +188,16 @@ enum
     POPUP_STAY_OPEN = 1,    /* clicks inside don't close it (egui's CloseOnClickOutside) */
 };
 /* A menu below `anchor`, opened and closed by clicking it; 1 while open:
- * build its rows, then kit_popup_end */
+ * build its rows, then kit_popup_end. width_pt is the whole menu's, as
+ * egui's Popup::width (0: the content's) */
 int kit_popup_menu(const kit_resp *anchor, int width_pt, int flags);
-/* The same, opened by a right click on `on`, at the pointer */
+/* The same, opened by a right click on `on`, at the pointer; width_pt is
+ * its content's (egui's ui.set_width), as for kit_submenu */
 int kit_context_menu(const kit_resp *on, int width_pt);
+/* A row of the popup being built that opens a menu beside it, on hover or a
+ * click (egui's menu_button in a menu); 1 while open: build its rows, then
+ * kit_popup_end. Closing it (a pick, kit_popup_close) closes its parents too. */
+int kit_submenu(const char *label, int width_pt);
 void kit_popup_end(void);
 void kit_popup_close(void);                 /* close the popup being built (egui's ui.close) */
 int kit_popup_open(kit_id anchor);
@@ -218,8 +225,9 @@ void kit_dialog_end(void);
 void kit_group_box_begin(const char *title, int w_pt);
 void kit_group_box_end(void);
 
-/* Notices fading at the bottom of the picture area (at most four) */
-void kit_toast(const char *text, double seconds);
-void kit_draw_toasts(int cx, int bottom);
+/* Paint over everything (popups, menus, dialogs) but the tooltip, taking no
+ * input (egui's Foreground layer painter, the toasts): kit_end calls
+ * draw(arg) after the overlays, with kit_dst() the window. One per frame. */
+void kit_on_top(void (*draw)(void *arg), void *arg);
 
 #endif

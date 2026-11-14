@@ -1131,10 +1131,13 @@ void host_run(int (*timeout_ms)(void *user), void *user)
         int tick = (ready & 2) || (wait >= 0 && os_now() >= deadline);
         if (ready & 2)
         {
+            /* Empty the pipe first, then let wakes write again: the other way round, a wake
+             * between the two had its byte drained with the flag left set, and every later
+             * wake (a friend's edit, the host leaving) went unseen until the next X event */
             char drain[64];
-            __sync_lock_release(&wake_pending);
             while (read(wake_pipe[0], drain, sizeof(drain)) > 0)
                 continue;
+            __sync_lock_release(&wake_pending);
         }
         while (!quitting && xw_take(ev, NULL, NULL))
             handle(ev);

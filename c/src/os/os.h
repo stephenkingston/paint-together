@@ -87,7 +87,7 @@ int os_write_file(const char *path, const void *data, size_t len);  /* 0 ok; wri
 int os_file_size(const char *path, int64_t *size, int64_t *mtime_secs);   /* 0 ok */
 int os_mkdirs(const char *path);                            /* 0 ok (also when it exists) */
 /* The folder Paint keeps its settings in, created on first use (no trailing slash):
- * $XDG_CONFIG_HOME/paint or ~/.config/paint; %APPDATA%\Paint on Windows */
+ * $XDG_CONFIG_HOME/paint or ~/.config/paint; %APPDATA%\Paint on Windows; $PAINT_CONFIG_DIR if set (tests) */
 const char *os_config_dir(void);
 const char *os_home_dir(void);
 /* List a folder: calls fn(name, is_dir, user) for each entry but "." and ".." */

@@ -22,7 +22,6 @@ enum
     MAX_WINS = 4,
     MAX_FOCUSABLE = 64,
     MAX_SCROLLS = 16,
-    MAX_TOASTS = 4,
     SEEN = 1024,        /* ids met this frame (open addressing) */
 };
 
@@ -57,6 +56,11 @@ typedef struct
 {
     int slot, depth, flags, close;
 } popup;
+
+enum
+{
+    POPUP_SUB = 0x100,  /* popup flags: a submenu, whose closing closes its parent */
+};
 
 typedef struct
 {
@@ -163,12 +167,10 @@ typedef struct
     } boxes[4];
     int n_boxes;
 
-    struct
-    {
-        char text[128];
-        double until;
-    } toasts[MAX_TOASTS];
-    int n_toasts;
+    void (*on_top)(void *);     /* kit_on_top's painter for this frame */
+    void *on_top_arg;
+    kit_resp last;              /* kit_last */
+    int move_dx, move_dy;       /* how far the pointer moved since the last frame */
 } kit_state;
 
 extern kit_state K;

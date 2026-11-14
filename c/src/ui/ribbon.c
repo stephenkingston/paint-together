@@ -133,8 +133,8 @@ kit_resp rb_big_split(int icon, uint32_t arg, const char *label, int checked, in
     kit_resp main = kit_interact_off(top, kit_id_of("main"), SENSE_CLICK, enabled);
     *menu = kit_interact_off(bottom, kit_id_of("menu"), SENSE_CLICK, enabled);
     kit_pop_id();
-    int open = kit_popup_open(menu->id);
-    int main_h = main.hovered, main_p = main.held, menu_h = menu->hovered || open, menu_p = menu->held || open;
+    /* As in app.rs, an open menu doesn't keep the button lit: only hover and press do */
+    int main_h = main.hovered, main_p = main.held, menu_h = menu->hovered, menu_p = menu->held;
     surface *d = K.dst;
     int rad = S(HIGHLIGHT_RADIUS);
     if (checked)
@@ -163,8 +163,7 @@ kit_resp rb_small_button(int icon, uint32_t arg, const char *label, int dropdown
     int tw = text_width(f, label, -1), icon_w = icon >= 0 ? S(20) : 0;
     rect r = kit_alloc_px(S(4) + icon_w + tw + (dropdown ? S(14) : S(6)), S(SMALL_H));
     kit_resp res = kit_interact_off(r, kit_id_of(label), SENSE_CLICK, enabled);
-    int open = dropdown && kit_popup_open(res.id);
-    rb_frame(K.dst, r, res.hovered || open, res.held || open, checked);
+    rb_frame(K.dst, r, res.hovered, res.held, checked);
     float cy = r.y + r.h / 2.0f;
     if (icon >= 0)
         icon_at(K.dst, icon, arg, r.x + SF(12), cy, S(16), enabled);
@@ -414,7 +413,7 @@ int rb_gallery(int icon, int n, int cols, int rows, int cell_pt, int checked, co
         rect b = rect_make(strip.x + S(1), y0, S(14), y1 - y0);
         int enabled = k == 2;
         kit_resp res = kit_interact_off(b, kit_id_n("strip", k), SENSE_CLICK, enabled);
-        if (enabled && (res.hovered || kit_popup_open(res.id)))
+        if (enabled && res.hovered)
             highlight(d, b, PAL_HOVER, PAL_HOVER_BORDER);
         icon_at(d, k == 0 ? ICON_SCROLL_UP : k == 1 ? ICON_SCROLL_DOWN : ICON_GALLERY_MORE, 0, b.x + b.w / 2.0f, b.y + b.h / 2.0f, S(12), enabled);
         if (enabled && more)
@@ -611,7 +610,7 @@ kit_resp rb_more_button(const char *count)
     rect r = kit_alloc(26, CONTENT_H - 8);
     kit_resp res = kit_interact(r, kit_id_of("more"), SENSE_CLICK);
     kit_hover_cursor(&res, CURSOR_HAND);
-    if (res.hovered || res.held || kit_popup_open(res.id))
+    if (res.hovered || res.held)
         highlight(K.dst, r, PAL_HOVER, PAL_HOVER_BORDER);
     else
         gfx_rrect_ring(K.dst, (float)r.x, (float)r.y, (float)r.w, (float)r.h, SF(HIGHLIGHT_RADIUS), SF(1), PAL_RIBBON_BORDER);

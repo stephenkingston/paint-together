@@ -684,6 +684,11 @@ static void test_files(void)
     app_request(a, PENDING_OPEN, "/no/such/file.png");
     CHECK(a->error != NULL, "an error for a missing file");
     app_dismiss_error(a);
+    /* A typed path's ~ is the home folder */
+    app_request(a, PENDING_OPEN, NULL);
+    app_ask_path_ok(a, "~/no-such-paint-picture.png");
+    CHECK(a->error && strstr(a->error, os_home_dir()), "%s", a->error ? a->error : "no error");
+    app_dismiss_error(a);
     /* Quit while dirty asks; Cancel stays */
     DRAG(a, BTN_LEFT, 10, 50, 60, 50);
     CHECK(app_close_requested(a) == 0 && a->confirm.kind == PENDING_QUIT, "asks before closing");
@@ -726,8 +731,12 @@ static void test_keys(void)
 
 int main(void)
 {
-#ifndef _WIN32
-    setenv("XDG_CONFIG_HOME", "/tmp/paint-c-test-app", 1);
+#ifdef _WIN32
+    char env[600];   /* its own settings folder, not the real one */
+    snprintf(env, sizeof env, "PAINT_CONFIG_DIR=%s\\paint-c-test-app", getenv("TEMP"));
+    _putenv(env);
+#else
+    setenv("PAINT_CONFIG_DIR", "/tmp/paint-c-test-app", 1);
 #endif
     os_init();
     test_pencil_undo_redo();

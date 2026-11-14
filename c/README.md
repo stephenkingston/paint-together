@@ -4,9 +4,12 @@ A port of Paint (the Rust app in `../src`) to pure C, for **Linux, Windows and m
 
 | | Binary (stripped) | Memory, idle window |
 |---|---|---|
-| Linux x86_64 | 428 KB, needs only libc + libm | 12–13 MB RSS (Rust: 139 MB) |
-| Windows x64 | 616 KB, one .exe, system DLLs only | 26.5 MB working set (Rust 0.3.1: 78 MB) |
+| Linux x86_64 | 432 KB, needs only libc + libm | 12–13 MB RSS (Rust: 139 MB) |
+| Windows x64 | 620 KB, one .exe, system DLLs only | 26.5 MB working set (Rust 0.3.1: 78 MB) |
 | macOS arm64 | 504 KB | 35–42 MB footprint (a bare Cocoa window is 16 MB) |
+
+Undo steps are stored packed (runs, and the change against the picture before), so a whole-picture fill on a
+4000×3000 picture costs kilobytes instead of 96 MB, with the same results as the Rust version's undo.
 
 It draws the whole window into a software framebuffer with its own drawing code and widget kit, and a thin host per
 platform shows it: the X11 wire protocol over the socket (no Xlib, MIT-SHM; runs under XWayland on Wayland desktops),
@@ -47,4 +50,5 @@ Files named `*_linux.c`, `*_posix.c`, `*_win.c` and `*_mac.c` are built only for
 - No input methods on X11 (keyboard layouts work; IBus/fcitx composition doesn't).
 - WebP pictures can't be opened or saved.
 - On X11 the pointer shapes are the classic X cursors, not the desktop's cursor theme.
+- `PAINT_CONFIG_DIR` overrides the settings folder (the tests use it); `PAINT_SCALE=150` sets the UI scale on X11.
 - Settings are kept in `~/.config/paint` (Linux), `%APPDATA%\Paint` (Windows) and `~/.config/paint` (macOS).

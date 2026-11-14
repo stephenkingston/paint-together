@@ -610,8 +610,10 @@ const char *os_config_dir(void)
     static char dir[1100];
     if (!dir[0])
     {
-        const char *x = getenv("XDG_CONFIG_HOME");
-        if (x && *x == '/')
+        const char *x = getenv("PAINT_CONFIG_DIR");          /* the tests keep their own settings */
+        if (x && *x)
+            snprintf(dir, sizeof dir, "%s", x);
+        else if ((x = getenv("XDG_CONFIG_HOME")) && *x == '/')
             snprintf(dir, sizeof dir, "%s/paint", x);
         else
             snprintf(dir, sizeof dir, "%s/.config/paint", os_home_dir());

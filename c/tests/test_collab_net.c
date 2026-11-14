@@ -316,14 +316,16 @@ static void handover(void)
     os_sock spare_a = link_take_spare(a), spare_b = link_take_spare(b);
     link_free(a);
     link_free(b);
-    hub *h = hub_new(img_dup(session_confirmed(sa)));
-    hub_set_door(h, 1, kid_list_clone(&sa->kids));
-    link *na = link_host_with(spare_a, h, "Ann", C2, NULL);
     char ann_addr[32] = "";
     for (int i = 0; i < sb->kids.n; i++)
         if (!strcmp(sb->kids.v[i].name, "Ann"))
             snprintf(ann_addr, sizeof ann_addr, "%s", sb->kids.v[i].addr);
+    /* Bob gets to Ann's door before she starts hosting: she must still be the host */
     link *nb = link_join(ann_addr, "Bob", C3, spare_b, NULL, err, sizeof err);
+    os_sleep_ms(100);
+    hub *h = hub_new(img_dup(session_confirmed(sa)));
+    hub_set_door(h, 1, kid_list_clone(&sa->kids));
+    link *na = link_host_with(spare_a, h, "Ann", C2, NULL);
     CHECK(wait_for(na, FROM_WELCOME, &m) && m.you == m.host);
     from_hub_free(&m);
     CHECK(wait_for(nb, FROM_WELCOME, &m) && m.seq == 0 && m.kids.n == 2);

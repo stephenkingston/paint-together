@@ -11,7 +11,6 @@
  */
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -330,24 +329,36 @@ static int send_all(int fd, const void *data, size_t len)
     return 0;
 }
 
-/* Read more from the bus; modal: while a picker may be open (no time limit) */
-static int bus_read(bus *b, int modal)
+/* How long the bus itself may take to answer, and the portal to take our call (starting up
+ * first, if it isn't running): past that there's no picker to be had from it. The user's
+ * time in the picker has no limit. */
+#define BUS_WAIT 1.0
+#define PORTAL_WAIT 2.0
+
+/* Wait for the bus to say something, until the time `until` (0: no limit); 1 when it has */
+static int bus_wait(int fd, double until)
+{
+    int left = until ? (int)((until - os_now()) * 1000) : -1;
+    return until && left <= 0 ? 0 : x11_modal_wait(fd, left);
+}
+
+/* Read more from the bus, waiting until the time `until` (0: no limit) */
+static int bus_read(bus *b, double until)
 {
     uint8_t chunk[4096];
-    int ready = modal ? x11_modal_wait(b->fd, -1) : poll(&(struct pollfd){ b->fd, POLLIN, 0 }, 1, 5000);
-    ssize_t got = ready > 0 ? read(b->fd, chunk, sizeof(chunk)) : -1;
+    ssize_t got = bus_wait(b->fd, until) > 0 ? read(b->fd, chunk, sizeof(chunk)) : -1;
     if (got <= 0)
         return -1;
     put(&b->in, chunk, (size_t)got);
     return 0;
 }
 
-/* The next whole message (in b->in until bus_drop); -1 when the bus went away */
-static int bus_next(bus *b, message *msg, size_t *len, int modal)
+/* The next whole message (in b->in until bus_drop); -1 when the bus went away or `until` passed */
+static int bus_next(bus *b, message *msg, size_t *len, double until)
 {
     while (!(*len = parse_message(b->in.data, b->in.len, msg)))
     {
-        if (bus_read(b, modal))
+        if (bus_read(b, until))
             return -1;
     }
     return 0;
@@ -366,6 +377,7 @@ static int bus_open(bus *b, char *name, size_t cap)
     *b = (bus){ .fd = -1 };
     if (bus_connect(b))
         return -1;
+    double until = os_now() + BUS_WAIT;
     snprintf(uid, sizeof(uid), "%u", (unsigned)getuid());
     for (size_t idx = 0; uid[idx]; idx++)
         snprintf(hex + 2 * idx, 3, "%02x", uid[idx]);
@@ -375,7 +387,7 @@ static int bus_open(bus *b, char *name, size_t cap)
         return -1;
     while (got < sizeof(line) - 1 && (!got || line[got - 1] != '\n'))
     {
-        if (poll(&(struct pollfd){ b->fd, POLLIN, 0 }, 1, 5000) <= 0 || read(b->fd, line + got, 1) != 1)
+        if (bus_wait(b->fd, until) <= 0 || read(b->fd, line + got, 1) != 1)
             return -1;
         got++;
     }
@@ -389,7 +401,7 @@ static int bus_open(bus *b, char *name, size_t cap)
     for (message reply; !failed;)
     {
         size_t size;
-        if (bus_next(b, &reply, &size, 0))
+        if (bus_next(b, &reply, &size, until))
             return -1;
         if (reply.reply_serial == b->serial)
         {
@@ -474,6 +486,16 @@ static char *response_path(message *msg)
     return NULL;
 }
 
+/* The pickers this session found missing, not to be tried again: without any, the
+ * "type a path" dialog then comes at once */
+enum
+{
+    LACK_PORTAL = 1,
+    LACK_ZENITY = 2,
+    LACK_KDIALOG = 4,
+};
+static int lacking;
+
 /* 0 with *path set (NULL: cancelled), or -1 when there is no portal to ask */
 static int portal_pick(int save, const char *title, const char *name, const char *const *filters, char **path)
 {
@@ -525,15 +547,17 @@ static int portal_pick(int save, const char *title, const char *name, const char
     uint32_t call = b.serial;
     int failed = send_all(b.fd, m.data, m.len), result = -1;
     free(m.data);
+    double until = os_now() + PORTAL_WAIT;     /* for the call's reply; then the picker is open */
     for (message msg; !failed;)
     {
         size_t size;
-        if (bus_next(&b, &msg, &size, 1))
+        if (bus_next(&b, &msg, &size, until))
             break;
         if (msg.reply_serial == call && msg.type == 3)
             break;  /* an error: no portal, or no file chooser in it */
         if (msg.reply_serial == call && msg.type == 2)
         {
+            until = 0;
             const char *handle = r_str(&msg.body);
             if (strcmp(handle, request))
             {   /* an old portal that did not use our token */
@@ -647,12 +671,14 @@ static char *dialog_pick(int save, const char *title, const char *name, const ch
     }
     put(&kfilter, "", 1);
     args[count] = NULL;
-    int missing = run_picker(args, &path);
+    int missing = (lacking & LACK_ZENITY) || run_picker(args, &path);
     if (missing)
     {
+        lacking |= LACK_ZENITY;
         char *kdialog[] = { "kdialog", "--title", (char *)title, save ? "--getsavefilename" : "--getopenfilename",
                             save && name ? (char *)name : (char *)os_home_dir(), (char *)kfilter.data, NULL };
-        missing = run_picker(kdialog, &path);
+        missing = (lacking & LACK_KDIALOG) || run_picker(kdialog, &path);
+        lacking |= missing ? LACK_KDIALOG : 0;
     }
     for (int idx = 0; idx < n_owned; idx++)
         free(owned[idx].data);
@@ -667,8 +693,9 @@ static char *pick(int save, const char *title, const char *name, const char *con
     int dummy;
     unavailable = unavailable ? unavailable : &dummy;
     *unavailable = 0;
-    if (portal_pick(save, title, name, filters, &path) == 0)
+    if (!(lacking & LACK_PORTAL) && portal_pick(save, title, name, filters, &path) == 0)
         return path;
+    lacking |= LACK_PORTAL;
     return dialog_pick(save, title, name, filters, unavailable);
 }
 

@@ -152,7 +152,7 @@ static void history_round_trips_patches_and_replacements(void)
     img *rotated = img_rotate90(im);
     img_free(im);
     im = rotated;
-    history_push(h, change_replace(before_rotate, img_dup(im)));
+    history_push(h, change_replace(before_rotate, im));
 
     CHECK(history_undo(h, &im), "undo 1");
     CHECK(same(im, after_patch), "undo 1 picture");
@@ -169,6 +169,127 @@ static void history_round_trips_patches_and_replacements(void)
     img_free(im);
     img_free(after_patch);
     img_free(original);
+}
+
+static uint32_t rnd(uint64_t *s)
+{
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    return (uint32_t)(*s >> 32);
+}
+
+/* Photo-like noise (hardly two neighbours alike) over the top two thirds, flat white below */
+static img *photo(int w, int h, uint64_t *rng)
+{
+    img *im = img_new(w, h, WHITE);
+    for (int y = 0; y < h * 2 / 3; y++)
+        for (int x = 0; x < w; x++)
+        {
+            uint32_t v = rnd(rng);
+            uint8_t *p = img_at(im, x, y);
+            p[0] = (uint8_t)(x + (v & 15));
+            p[1] = (uint8_t)(y + (v >> 4 & 15));
+            p[2] = (uint8_t)(v >> 8);
+            p[3] = 255;
+        }
+    return im;
+}
+
+/* Random edits of every kind the app records, then undo all and redo all: every picture comes back
+ * byte for byte, both sides of each step unpack exactly, and no step packs bigger than its raw pixels */
+static void history_packs_every_kind_of_step(void)
+{
+    enum { STEPS = 80 };
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    img *im = photo(120, 90, &rng), *states[STEPS + 1];
+    history *h = history_new();
+    paint_font font;
+    int have_font = fonts_count() > 0 && fonts_load(fonts_default_family(), 0, 0, &font) == 0;
+    int n = 0;
+    states[n++] = img_dup(im);
+    for (int s = 0; s < STEPS; s++)
+    {
+        img *before = img_dup(im);
+        mask *m = mask_new(im->w, im->h);
+        pt a = pt_make((float)(rnd(&rng) % im->w), (float)(rnd(&rng) % im->h));
+        pt b = pt_make((float)(rnd(&rng) % im->w), (float)(rnd(&rng) % im->h));
+        irect r = IRECT_EMPTY;
+        change *c = NULL;
+        int kind = (int)(rnd(&rng) % 8);
+        if (kind == 0)          /* pencil */
+        {
+            r = mask_square_line(m, a, b, 1);
+            raster_blend_mask(im, m, BLACK, 1.0f, r);
+        }
+        else if (kind == 1)     /* brush */
+        {
+            brush_kind k = (brush_kind)(rnd(&rng) % BRUSH_COUNT);
+            r = brush_segment(k, m, a, b, 10.0f, &rng);
+            raster_blend_mask(im, m, RED, brush_opacity(k), r);
+        }
+        else if (kind == 2)     /* fill */
+            r = raster_flood_fill(im, (int)a.x, (int)a.y, BLUE, (uint8_t)(rnd(&rng) % 80));
+        else if (kind == 3)     /* a pasted photo, partly off the picture */
+        {
+            img *p = photo(30 + (int)(rnd(&rng) % 40), 20 + (int)(rnd(&rng) % 40), &rng);
+            r = irect_make((int)a.x - 10, (int)a.y - 10, (int)a.x - 10 + p->w, (int)a.y - 10 + p->h);
+            raster_replace(im, p, r.x0, r.y0);
+            img_free(p);
+        }
+        else if (kind == 4 && have_font)
+        {
+            r = ptext_render(m, &font, 18.0f, "Hello", a, 0, 0);
+            raster_blend_mask(im, m, BLACK, 1.0f, r);
+        }
+        else if (kind == 5)     /* two colours at random: short runs everywhere, the packer's worst case */
+        {
+            r = irect_intersect(irect_around(a.x, a.y, b.x, b.y, 2.0f), irect_of(im));
+            for (int y = r.y0; y < r.y1; y++)
+                for (int x = r.x0; x < r.x1; x++)
+                    memcpy(img_at(im, x, y), rnd(&rng) & 1 ? &RED : &WHITE, 4);
+        }
+        else if (kind >= 6)     /* invert, rotate */
+        {
+            img *out = kind == 6 ? raster_invert(im) : img_rotate90(im);
+            c = change_replace(before, out);
+            before = NULL;
+            img_free(im);
+            im = out;
+        }
+        if (!c && before)
+            c = change_patch(before, im, r);
+        if (c)
+        {
+            size_t raw = ((size_t)c->bw * c->bh + (size_t)c->aw * c->ah) * 4;
+            CHECK(c->bytes <= raw + 5 * (size_t)(c->bh + c->ah), "step %d (kind %d): %lu bytes, raw %lu", s, kind,
+                  (unsigned long)c->bytes, (unsigned long)raw);
+            int patch = c->kind == CHANGE_PATCH;
+            img *was = patch ? img_crop(states[n - 1], c->x, c->y, c->bw, c->bh) : img_dup(states[n - 1]);
+            img *now = patch ? img_crop(im, c->x, c->y, c->aw, c->ah) : img_dup(im);
+            img *b0 = change_image(c, 0), *a0 = change_image(c, 1);
+            CHECK(same(b0, was) && same(a0, now), "step %d (kind %d) unpacks", s, kind);
+            img_free(was);
+            img_free(now);
+            img_free(b0);
+            img_free(a0);
+            history_push(h, c);
+            states[n++] = img_dup(im);
+        }
+        img_free(before);
+        mask_free(m);
+    }
+    CHECK(n > STEPS / 2, "only %d steps changed anything", n - 1);
+    for (int i = n - 1; i > 0; i--)
+        CHECK(history_undo(h, &im) && same(im, states[i - 1]), "undo to %d", i - 1);
+    CHECK(!history_can_undo(h), "all undone");
+    for (int i = 1; i < n; i++)
+        CHECK(history_redo(h, &im) && same(im, states[i]), "redo to %d", i);
+    CHECK(!history_can_redo(h), "all redone");
+    for (int i = 0; i < n; i++)
+        img_free(states[i]);
+    history_free(h);
+    img_free(im);
 }
 
 static void shapes_fit_their_box(void)
@@ -553,6 +674,7 @@ int main(void)
         { "flood_fill_tolerance_terminates_when_fill_matches_target", flood_fill_tolerance_terminates_when_fill_matches_target },
         { "blend_over_mixes_colours", blend_over_mixes_colours },
         { "history_round_trips_patches_and_replacements", history_round_trips_patches_and_replacements },
+        { "history_packs_every_kind_of_step", history_packs_every_kind_of_step },
         { "shapes_fit_their_box", shapes_fit_their_box },
         { "every_brush_lays_paint", every_brush_lays_paint },
         { "resize_canvas_pads_with_fill", resize_canvas_pads_with_fill },

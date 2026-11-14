@@ -84,6 +84,8 @@ struct host_win
     double factor;              /* device pixels per point */
     int buttons, ctrl_click, cursor, hidden, marked;
     int ime_x, ime_y, ime_h;
+    unsigned long typed;        /* UTF-16 units typed: where input methods think the caret is */
+    double caret_at;            /* when the app last showed a caret (host_ime_spot) */
     void (*on_event)(void *user, const ui_event *ev);
     void *user;
 };
@@ -94,6 +96,7 @@ static Class view_class;
 static CGColorSpaceRef srgb;
 static volatile int wake_pending;
 static int quitting, scale = 100, dispatching, tick_pending;
+static int waiting;              /* inside nextEventMatchingMask (Apple events: opening files, Quit from the Dock) */
 static int (*run_timeout)(void *user);     /* host_run's, for frames during a live resize */
 static void *run_user;
 static id input_event;          /* the mouse or key event being handled: its modifiers go with what it makes */
@@ -136,7 +139,7 @@ static void put_event(ui_event ev)
 {
     if (!W)
         return;
-    ev.mods = mods_of((ip)msg(input_event ? input_event : CLS("NSEvent"), "modifierFlags"));
+    ev.mods |= mods_of((ip)msg(input_event ? input_event : CLS("NSEvent"), "modifierFlags"));
     ev.time = os_now();
     if (dispatching)
     {   /* the app is busy: keep what can wait, drop input */
@@ -160,6 +163,8 @@ static void put_event(ui_event ev)
     }
     n_held = tick_pending = 0;
     dispatching = 0;
+    if (waiting)
+        host_wake();    /* the wait goes on after this: end it, so host_run draws the frame */
 }
 
 /* A point in the window (points, y up) in device pixels of the view, y down */
@@ -287,6 +292,21 @@ void host_present(host_win *win, rect dirty)
 
 /* ---- the pointer ---- */
 
+/* Four arrows, as winit (WebKit's cursor; AppKit has no public one), or an open hand if it has gone */
+static id move_cursor(void)
+{
+    static id cursor;
+    if (cursor)
+        return cursor;
+    id image = msg1(msg(CLS("NSImage"), "alloc"), "initByReferencingFile:",
+                    STR("/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/"
+                        "Versions/A/Resources/cursors/move/cursor.pdf"));
+    if (image && msg_is(image, "isValid"))
+        cursor = MSG(id, id, CGPoint)(msg(CLS("NSCursor"), "alloc"), S("initWithImage:hotSpot:"), image, CGPointMake(12, 12));
+    release(image);
+    return cursor ? cursor : (cursor = msg(msg(CLS("NSCursor"), "openHandCursor"), "retain"));
+}
+
 static void apply_cursor(host_win *win)
 {
     static const char *const names[CURSOR_BUSY + 1][2] = {
@@ -308,7 +328,7 @@ static void apply_cursor(host_win *win)
     const char *name = names[win->cursor][0];
     if (names[win->cursor][1] && !msg1_is(CLS("NSCursor"), "respondsToSelector:", S(name)))
         name = names[win->cursor][1];   /* the private ones may go away */
-    msg(msg(CLS("NSCursor"), name), "set");
+    msg(win->cursor == CURSOR_MOVE ? move_cursor() : msg(CLS("NSCursor"), name), "set");
 }
 
 static void show_pointer(host_win *win)
@@ -414,6 +434,9 @@ static void on_mouse(id self, id event)
             put_event((ui_event){ .type = EV_WHEEL, .x = x, .y = y, .wheel_x = (float)-dx, .wheel_y = (float)dy });
         break;
     }
+    case 30:    /* a pinch: Command-wheel, zooming by e^magnification as egui does (the app zooms by e^(0.2 y)) */
+        put_event((ui_event){ .type = EV_WHEEL, .x = x, .y = y, .wheel_y = (float)(msg_f(event, "magnification") * 5), .mods = KMOD_CTRL });
+        break;
     }
 }
 
@@ -515,11 +538,23 @@ static void insert_text(id self, SEL cmd, id text, text_range replace)
     if (msg1_is(text, "isKindOfClass:", CLS("NSAttributedString")))
         text = msg(text, "string");
     const unsigned char *utf8 = (const unsigned char *)msg(text, "UTF8String");
-    if (W)
-        W->marked = 0;
+    host_win *win = W;
+    if (!win)
+        return;
+    win->marked = 0;
     /* not control characters, nor the private-use ones AppKit gives function keys */
-    if (utf8 && utf8[0] >= ' ' && utf8[0] != 0x7F && !(utf8[0] == 0xEF && utf8[1] >= 0x9C && utf8[1] <= 0xA3))
-        put_event((ui_event){ .type = EV_TEXT, .text = (const char *)utf8 });
+    if (!utf8 || utf8[0] < ' ' || utf8[0] == 0x7F || (utf8[0] == 0xEF && utf8[1] >= 0x9C && utf8[1] <= 0xA3))
+        return;
+    /* The accent menu (holding a key) replaces the character just typed: Backspace it first, while
+     * the app shows a caret (elsewhere Backspace would delete a selection) */
+    if (replace.length && replace.location + replace.length == win->typed && os_now() - win->caret_at < 2)
+    {
+        win->typed -= replace.length;
+        for (unsigned long n = replace.length; n-- && W == win;)
+            put_event((ui_event){ .type = EV_KEY, .key = KEY_BACKSPACE });
+    }
+    win->typed += (unsigned long)(ip)msg(text, "length");
+    put_event((ui_event){ .type = EV_TEXT, .text = (const char *)utf8 });
 }
 
 static void set_marked(id self, SEL cmd, id text, text_range selected, text_range replace)
@@ -541,12 +576,12 @@ static BOOL has_marked(id self, SEL cmd)
 
 static text_range marked_range(id self, SEL cmd)
 {
-    return W && W->marked ? (text_range){ 0, (unsigned long)W->marked } : (text_range){ (unsigned long)LONG_MAX, 0 };
+    return W && W->marked ? (text_range){ W->typed, (unsigned long)W->marked } : (text_range){ (unsigned long)LONG_MAX, 0 };
 }
 
 static text_range selected_range(id self, SEL cmd)
 {
-    return (text_range){ W ? (unsigned long)W->marked : 0, 0 };
+    return (text_range){ W ? W->typed + (unsigned long)W->marked : 0, 0 };
 }
 
 static id no_substring(id self, SEL cmd, text_range range, text_range *actual)
@@ -586,6 +621,7 @@ void host_ime_spot(host_win *win, int x, int y, int h)
     win->ime_x = x;
     win->ime_y = y;
     win->ime_h = h;
+    win->caret_at = os_now();
     msg(msg(win->view, "inputContext"), "invalidateCharacterCoordinates");
 }
 
@@ -698,6 +734,7 @@ static void make_view_class(void)
         { "mouseExited:", (IMP)on_input, "v@:@" },
         { "cursorUpdate:", (IMP)on_input, "v@:@" },
         { "scrollWheel:", (IMP)on_input, "v@:@" },
+        { "magnifyWithEvent:", (IMP)on_input, "v@:@" },
         { "keyDown:", (IMP)on_input, "v@:@" },
         { "keyUp:", (IMP)on_input, "v@:@" },
         { "flagsChanged:", (IMP)on_input, "v@:@" },
@@ -814,7 +851,10 @@ void host_wake(void)
 
 static id next_event(id until)
 {
-    return msg4(app, "nextEventMatchingMask:untilDate:inMode:dequeue:", ~(ip)0, until, kCFRunLoopDefaultMode, YES);
+    waiting = 1;
+    id ev = msg4(app, "nextEventMatchingMask:untilDate:inMode:dequeue:", ~(ip)0, until, kCFRunLoopDefaultMode, YES);
+    waiting = 0;
+    return ev;
 }
 
 static void send_event(id ev)
@@ -1099,6 +1139,8 @@ static char *run_panel(host_win *owner, id panel, const char *title, const char 
     if (owner)
         show_pointer(owner);
     ip answer = (ip)msg(panel, "runModal");
+    if (owner)  /* AppKit leaves no window key after the panel: the keyboard would go nowhere */
+        msg1(owner->window, "makeKeyAndOrderFront:", nil);
     return answer == 1 ? dup_str(msg(msg(panel, "URL"), "path")) : NULL;    /* NSModalResponseOK */
 }
 

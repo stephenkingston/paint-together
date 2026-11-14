@@ -539,7 +539,7 @@ int app_together_status(const app *a, char *buf, size_t cap);
 /* ---- drawing together, the parts tests drive (Rust's names) ---- */
 
 void app_net_receive(app *a, from_hub *msg);        /* uses up msg */
-void app_pump_network(app *a);
+int app_pump_network(app *a);                       /* 1 if anything came in */
 void app_flush_network(app *a);
 /* What to send the hub now: my finished edits, and (at most 30 times a second)
  * my drawing in progress and pointer. Malloc'd, *n of them. */

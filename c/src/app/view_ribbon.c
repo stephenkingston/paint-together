@@ -518,6 +518,7 @@ static void together_tab(app *a)
         int let_in = !(hosting && a->session ? a->session->ask_first : a->ask_first);
         if (kit_checkbox("Let friends in\nwithout asking", &let_in))
             app_set_ask_first(a, !let_in);
+        kit_tooltip(kit_last(), "When this is off, you're asked about each friend who wants to join, and can let them in or not");
         kit_end_layout();
         kit_space(6);
     }
@@ -615,6 +616,7 @@ static void together_tab(app *a)
     kit_row_centered(ITEM_SPACING_X, INTERACT_H);
     rb_avatar(a->me_name, kid_color(a->me_color), 20);
     int f = kit_text_field("me", a->me_name, sizeof a->me_name, 20, 130, NULL, editable ? 0 : FIELD_DISABLED);
+    kit_tooltip(kit_last(), "Your name, shown to friends");
     if (f & KIT_LOST_FOCUS)
         app_set_me_name(a, a->me_name);
     kit_end_layout();

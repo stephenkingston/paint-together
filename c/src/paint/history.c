@@ -2,16 +2,36 @@
  * Paint (C port) - undo and redo (Rust: history.rs)
  *
  * Two stacks of edits. Pushing clears the redo stack and drops the oldest
- * undo steps while their pixels add up to more than the 1 GB budget (always
- * keeping the newest).
+ * undo steps while their packed pixels add up to more than the 1 GB budget
+ * (always keeping the newest).
+ *
+ * A step's pixels are packed row by row into ops, each a varint
+ * (count << 2 | kind) followed by its pixels:
+ *   OP_LITERAL  count pixels, 4 bytes each
+ *   OP_RUN      one pixel, repeated count times
+ *   OP_SAME     no pixels: the after side's pixels equal the before side's
+ *   OP_XOR      one value: the after side's pixels are the before side's
+ *               XOR it (an inverted picture is one op a row)
+ * (OP_SAME and OP_XOR only in the after side, when both sides are the
+ * same size.) A flat fill becomes a few bytes a row, and a brush stroke's
+ * after side only the pixels it changed. A run is taken only when it is
+ * shorter than spelling its pixels out, so a row never packs bigger than
+ * its raw pixels plus one op.
  */
 #include <stdlib.h>
 #include <string.h>
 #include "paint/history.h"
-#include "paint/raster.h"
 
-/* Total pixel bytes kept for undo before the oldest steps are dropped */
+/* Total packed bytes kept for undo before the oldest steps are dropped */
 #define BUDGET_BYTES ((size_t)1 << 30)
+
+enum
+{
+    OP_LITERAL,
+    OP_RUN,
+    OP_SAME,
+    OP_XOR,
+};
 
 typedef struct
 {
@@ -29,8 +49,166 @@ struct history
 {
     stack undo, redo;
     uint64_t next_id;
-    size_t undo_bytes;      /* pixel bytes held by the undo stack */
+    size_t undo_bytes;      /* packed bytes held by the undo stack */
 };
+
+/* ---------------------------------------------------------------- packing */
+
+static inline uint32_t px32(const uint8_t *p)
+{
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+static uint8_t *put_op(uint8_t *o, size_t n, int op)
+{
+    size_t v = n << 2 | (size_t)op;
+    for (; v > 127; v >>= 7)
+        *o++ = (uint8_t)(v | 128);
+    *o++ = (uint8_t)v;
+    return o;
+}
+
+/* Where, from i on, the first run worth an op starts (w if none): three pixels of one colour, or (in the
+ * after side) two unchanged pixels or three changed alike. Kept tight: photos are scanned through here. */
+static int literal_end(const uint8_t *row, const uint8_t *ref, int i, int w)
+{
+    for (; i + 2 < w; i++)
+    {
+        uint32_t p = px32(row + (size_t)i * 4), q = px32(row + (size_t)i * 4 + 4), r = px32(row + (size_t)i * 4 + 8);
+        if (p == q && q == r)
+            return i;
+        if (ref)
+        {
+            uint32_t x = p ^ px32(ref + (size_t)i * 4);
+            if (x == (q ^ px32(ref + (size_t)i * 4 + 4)) && (!x || x == (r ^ px32(ref + (size_t)i * 4 + 8))))
+                return i;
+        }
+    }
+    /* The last two pixels may still be unchanged */
+    return ref && i + 1 < w && !memcmp(row + (size_t)i * 4, ref + (size_t)i * 4, 8) ? i : w;
+}
+
+/* Pack a row of w pixels; ref is the same row before the edit, or NULL (*delta is set if an op uses it) */
+static uint8_t *pack_row(uint8_t *o, const uint8_t *row, const uint8_t *ref, int w, int *delta)
+{
+    for (int i = 0; i < w;)
+    {
+        int end = literal_end(row, ref, i, w);
+        if (end > i)
+        {
+            size_t n = (size_t)(end - i) * 4;
+            o = put_op(o, (size_t)(end - i), OP_LITERAL);
+            memcpy(o, row + (size_t)i * 4, n);
+            o += n;
+            i = end;
+            if (i == w)
+                break;
+        }
+        /* Take the longer of the run of one colour and the run of one change (which costs no pixel when
+         * the change is none) */
+        uint32_t p = px32(row + (size_t)i * 4), x = ref ? p ^ px32(ref + (size_t)i * 4) : 0;
+        int d = 0, run = 1;
+        if (ref)
+            while (i + d < w && (px32(row + (size_t)(i + d) * 4) ^ px32(ref + (size_t)(i + d) * 4)) == x)
+                d++;
+        while (i + run < w && px32(row + (size_t)(i + run) * 4) == p)
+            run++;
+        if (d >= (x ? 3 : 2) && d >= run)
+        {
+            o = put_op(o, (size_t)d, x ? OP_XOR : OP_SAME);
+            *delta = 1;
+            i += d;
+            if (!x)
+                continue;
+        }
+        else
+        {
+            o = put_op(o, (size_t)run, OP_RUN);
+            x = p;
+            i += run;
+        }
+        memcpy(o, &x, 4);
+        o += 4;
+    }
+    return o;
+}
+
+/* Unpack a row of w pixels; for OP_SAME and OP_XOR, `row` must already hold the row before the edit */
+static const uint8_t *unpack_row(const uint8_t *s, uint8_t *row, int w)
+{
+    for (int i = 0; i < w;)
+    {
+        size_t v = 0;
+        for (int shift = 0;; shift += 7)
+        {
+            v |= (size_t)(*s & 127) << shift;
+            if (!(*s++ & 128))
+                break;
+        }
+        int n = (int)(v >> 2), op = (int)(v & 3);
+        uint8_t *o = row + (size_t)i * 4;
+        if (op == OP_LITERAL)
+        {
+            memcpy(o, s, (size_t)n * 4);
+            s += (size_t)n * 4;
+        }
+        else if (op == OP_RUN)
+        {
+            /* Doubling copies: a whole-canvas fill unpacks at memcpy speed */
+            memcpy(o, s, 4);
+            for (size_t k = 1; k < (size_t)n; k *= 2)
+                memcpy(o + k * 4, o, ((size_t)n - k < k ? (size_t)n - k : k) * 4);
+            s += 4;
+        }
+        else if (op == OP_XOR)
+        {
+            uint32_t x = px32(s);
+            for (int k = 0; k < n; k++)
+            {
+                uint32_t q = px32(o + (size_t)k * 4) ^ x;
+                memcpy(o + (size_t)k * 4, &q, 4);
+            }
+            s += 4;
+        }
+        i += n;
+    }
+    return s;
+}
+
+/* Pack the rows of r in im (against the same rows of rr in ref, if given) into a buffer that fits;
+ * it starts at the worst case, given back once the size is known */
+static uint8_t *pack_side(const img *im, irect r, const img *ref, irect rr, int *delta, size_t *len)
+{
+    int w = irect_w(r), h = irect_h(r);
+    uint8_t *buf = malloc((size_t)h * ((size_t)w * 4 + 5) + 1), *o = buf;
+    if (!buf)
+        return NULL;
+    for (int j = 0; j < h; j++)
+        o = pack_row(o, img_at(im, r.x0, r.y0 + j), ref ? img_at(ref, rr.x0, rr.y0 + j) : NULL, w, delta);
+    *len = (size_t)(o - buf);
+    uint8_t *fit = realloc(buf, *len + 1);
+    return fit ? fit : buf;
+}
+
+/* rb of b before, ra of a after (packed against b when the sizes match) */
+static change *pack_change(int kind, int x, int y, const img *b, irect rb, const img *a, irect ra)
+{
+    int bw = irect_w(rb), bh = irect_h(rb), aw = irect_w(ra), ah = irect_h(ra), delta = 0;
+    size_t blen = 0, alen = 0;
+    change *c = calloc(1, sizeof *c);
+    uint8_t *pb = c ? pack_side(b, rb, NULL, rb, &delta, &blen) : NULL;
+    uint8_t *pa = pb ? pack_side(a, ra, bw == aw && bh == ah ? b : NULL, rb, &delta, &alen) : NULL;
+    if (!pa)
+    {
+        free(pb);
+        free(c);
+        return NULL;
+    }
+    *c = (change){ kind, x, y, bw, bh, aw, ah, delta, pb, pa, blen + alen };
+    return c;
+}
 
 change *change_patch(const img *before, const img *after, irect r)
 {
@@ -42,34 +220,13 @@ change *change_patch(const img *before, const img *after, irect r)
         same = !memcmp(img_at(before, r.x0, y), img_at(after, r.x0, y), (size_t)irect_w(r) * 4);
     if (same)
         return NULL;
-    change *c = calloc(1, sizeof *c);
-    if (!c)
-        return NULL;
-    c->kind = CHANGE_PATCH;
-    c->x = r.x0;
-    c->y = r.y0;
-    c->before = raster_crop(before, r);
-    c->after = raster_crop(after, r);
-    if (!c->before || !c->after)
-    {
-        change_free(c);
-        return NULL;
-    }
-    return c;
+    return pack_change(CHANGE_PATCH, r.x0, r.y0, before, r, after, r);
 }
 
-change *change_replace(img *before, img *after)
+change *change_replace(img *before, const img *after)
 {
-    change *c = calloc(1, sizeof *c);
-    if (!c)
-    {
-        img_free(before);
-        img_free(after);
-        return NULL;
-    }
-    c->kind = CHANGE_REPLACE;
-    c->before = before;
-    c->after = after;
+    change *c = pack_change(CHANGE_REPLACE, 0, 0, before, irect_of(before), after, irect_of(after));
+    img_free(before);
     return c;
 }
 
@@ -77,30 +234,76 @@ void change_free(change *c)
 {
     if (c)
     {
-        img_free(c->before);
-        img_free(c->after);
+        free(c->before);
+        free(c->after);
         free(c);
     }
 }
 
-static size_t change_bytes(const change *c)
+void change_rows(const change *c, int which, void (*fn)(int y, const uint8_t *before, const uint8_t *after, void *user),
+                 void *user)
 {
-    return ((size_t)c->before->w * c->before->h + (size_t)c->after->w * c->after->h) * 4;
+    int h = which & 1 ? c->bh : c->ah;
+    /* The after side needs the before row under it when it was packed against it */
+    uint8_t *b = which & 1 || c->delta ? malloc((size_t)c->bw * 4 + 4) : NULL;
+    uint8_t *a = which == 2 && c->delta ? b : which & 2 ? malloc((size_t)c->aw * 4 + 4) : NULL;
+    const uint8_t *sb = c->before, *sa = c->after;
+    for (int y = 0; y < h; y++)
+    {
+        if (b)
+            sb = unpack_row(sb, b, c->bw);
+        if (a)
+        {
+            if (a != b && c->delta)
+                memcpy(a, b, (size_t)c->aw * 4);
+            sa = unpack_row(sa, a, c->aw);
+        }
+        fn(y, which & 1 ? b : NULL, a, user);
+    }
+    if (a != b)
+        free(a);
+    free(b);
+}
+
+typedef struct
+{
+    img *dst;
+    int x, y, w;
+} put_ctx;
+
+static void put_row(int y, const uint8_t *before, const uint8_t *after, void *user)
+{
+    put_ctx *p = user;
+    const uint8_t *row = before ? before : after;
+    int py = p->y + y, x0 = p->x > 0 ? p->x : 0, x1 = p->x + p->w < p->dst->w ? p->x + p->w : p->dst->w;
+    if (py >= 0 && py < p->dst->h && x0 < x1)
+        memcpy(img_at(p->dst, x0, py), row + (size_t)(x0 - p->x) * 4, (size_t)(x1 - x0) * 4);
+}
+
+img *change_image(const change *c, int after)
+{
+    img *im = img_new(after ? c->aw : c->bw, after ? c->ah : c->bh, (rgba){ 0, 0, 0, 0 });
+    if (im)
+    {
+        put_ctx p = { im, 0, 0, im->w };
+        change_rows(c, after ? 2 : 1, put_row, &p);
+    }
+    return im;
 }
 
 void change_apply(const change *c, img **picture, int undo)
 {
-    const img *src = undo ? c->before : c->after;
     if (c->kind == CHANGE_PATCH)
-        raster_replace(*picture, src, c->x, c->y);
-    else
     {
-        img *copy = img_dup(src);
-        if (copy)
-        {
-            img_free(*picture);
-            *picture = copy;
-        }
+        put_ctx p = { *picture, c->x, c->y, c->bw };
+        change_rows(c, undo ? 1 : 2, put_row, &p);
+        return;
+    }
+    img *now = change_image(c, !undo);
+    if (now)
+    {
+        img_free(*picture);
+        *picture = now;
     }
 }
 
@@ -144,11 +347,11 @@ void history_push(history *h, change *c)
     stack_clear(&h->redo);
     h->next_id++;
     stack_push(&h->undo, (edit){ h->next_id, c });
-    h->undo_bytes += change_bytes(c);
+    h->undo_bytes += c->bytes;
     size_t drop = 0;
     while (h->undo.n - drop > 1 && h->undo_bytes > BUDGET_BYTES)
     {
-        h->undo_bytes -= change_bytes(h->undo.v[drop].c);
+        h->undo_bytes -= h->undo.v[drop].c->bytes;
         change_free(h->undo.v[drop].c);
         drop++;
     }
@@ -164,9 +367,9 @@ static void move_top(history *h, stack *from, stack *to)
 {
     edit e = from->v[--from->n];
     if (from == &h->undo)
-        h->undo_bytes -= change_bytes(e.c);
+        h->undo_bytes -= e.c->bytes;
     else
-        h->undo_bytes += change_bytes(e.c);
+        h->undo_bytes += e.c->bytes;
     stack_push(to, e);
 }
 

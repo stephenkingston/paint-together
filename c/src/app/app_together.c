@@ -687,15 +687,15 @@ void app_net_receive(app *a, from_hub *msg)
     kid_list_free(&before);
 }
 
-void app_pump_network(app *a)
+int app_pump_network(app *a)
 {
-    if (a->discovery)
-        discovery_poll(a->discovery);
+    int news = a->discovery && discovery_poll(a->discovery);
     if (a->session)
         a->session->now = a->now;
     link_event ev;
     while (a->link && link_recv(a->link, &ev))
     {
+        news = 1;
         if (ev.kind == LINK_MESSAGE)
             app_net_receive(a, &ev.msg);
         else if (!a->session)
@@ -710,6 +710,7 @@ void app_pump_network(app *a)
         link_event_free(&ev);
     }
     step_handover(a);
+    return news;
 }
 
 to_hub *app_net_outbox(app *a, double now, int *n)
@@ -781,8 +782,8 @@ void app_flush_network(app *a)
 int app_tick(app *a, double now)
 {
     a->now = now;
-    int changed = 0;
-    app_pump_network(a);
+    /* Friends coming and going, the door and the drawings nearby show on the ribbon: draw */
+    int changed = app_pump_network(a);
     if (a->op.kind == OP_STROKE && a->op.pen == PEN_BRUSH && a->op.brush == BRUSH_AIRBRUSH)
     {
         float dt = (float)(now - a->last_spray_);

@@ -607,6 +607,8 @@ static void test_friends_see_my_pointer(void)
 
 typedef int (*until_fn)(app **k);
 
+static int pumped_news[3];      /* what app_pump_network said, for app_tick to redraw */
+
 static int run_until(app **k, int n, const char *what, until_fn done)
 {
     for (int round = 0; round < 1500; round++)
@@ -614,7 +616,7 @@ static int run_until(app **k, int n, const char *what, until_fn done)
         for (int i = 0; i < n; i++)
         {
             k[i]->now = os_now();
-            app_pump_network(k[i]);
+            pumped_news[i] |= app_pump_network(k[i]);
             app_flush_network(k[i]);
         }
         if (done(k))
@@ -679,9 +681,11 @@ static void test_handover(void)
     app_join_together(k[1], addr);
     if (!run_until(k, 3, "kid 1 is in", kid1_in))
         goto done;
+    pumped_news[0] = 0;
     app_join_together(k[2], addr);
     if (!run_until(k, 3, "kid 2 is in", kid2_in) || !run_until(k, 3, "everyone sees three kids", three_kids))
         goto done;
+    CHECK(pumped_news[0], "the host hears of kid 2 (and redraws its list of friends)");
     line(k[1], TOOL_PENCIL, RED, 10, 20, 100, 20);
     if (!run_until(k, 3, "kid 1's line reaches everyone", red_everywhere))
         goto done;
@@ -853,8 +857,12 @@ static void test_random_sessions(void)
 
 int main(void)
 {
-#ifndef _WIN32
-    setenv("XDG_CONFIG_HOME", "/tmp/paint-c-test-together", 1);
+#ifdef _WIN32
+    char env[600];   /* its own settings folder, not the real one */
+    snprintf(env, sizeof env, "PAINT_CONFIG_DIR=%s\\paint-c-test-together", getenv("TEMP"));
+    _putenv(env);
+#else
+    setenv("PAINT_CONFIG_DIR", "/tmp/paint-c-test-together", 1);
 #endif
     os_init();
     test_joining_gets_the_hosts_picture();

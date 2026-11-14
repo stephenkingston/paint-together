@@ -573,6 +573,16 @@ host_win *host_open(const char *title, int w, int h, void (*on_event)(void *user
     host_win *win = calloc(1, sizeof(*win));
     rect area = host_work_area();
     SIZE outer = frame_size(NULL, w, h, WS_OVERLAPPEDWINDOW);
+    if (outer.cx > area.w)
+    {   /* the frame too within the work area, so the title bar is on screen */
+        w -= outer.cx - area.w;
+        outer.cx = area.w;
+    }
+    if (outer.cy > area.h)
+    {
+        h -= outer.cy - area.h;
+        outer.cy = area.h;
+    }
     WCHAR *wide = to_wide(title);
     win->on_event = on_event;
     win->user = user;
@@ -975,10 +985,12 @@ static WCHAR *filter_list(const char *const *filters)
     for (int idx = 0; filters && filters[idx]; idx++)
         len += strlen(filters[idx]) + 1;
     char *list = calloc(len, 1), *put = list;
-    for (int idx = 0; filters && filters[idx] && filters[idx + 1]; idx++)
+    for (int idx = 0; filters && filters[idx] && filters[idx + 1]; idx += 2)
     {
         strcpy(put, filters[idx]);
         put += strlen(filters[idx]) + 1;
+        strcpy(put, filters[idx + 1]);
+        put += strlen(filters[idx + 1]) + 1;
     }
     WCHAR *wide = malloc(sizeof(WCHAR) * len);
     int count = MultiByteToWideChar(CP_UTF8, 0, list, (int)len, wide, (int)len);

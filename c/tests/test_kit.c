@@ -311,6 +311,15 @@ static void test_clicks(void)
     send(EV_UP, 300, 200);
     button_frame(&clicks);
     CHECK(clicks == 2);
+    /* Two clicks waiting for one frame are two clicks, one frame each */
+    send(EV_DOWN, 10, 10);
+    send(EV_UP, 10, 10);
+    send(EV_DOWN, 10, 10);
+    send(EV_UP, 10, 10);
+    button_frame(&clicks);
+    CHECK(clicks == 3 && kit_wants_frame());
+    button_frame(&clicks);
+    CHECK(clicks == 4);
     /* Hovered when the pointer is over it */
     send(EV_MOVE, 5, 5);
     CHECK(button_frame(&clicks).hovered);
@@ -441,6 +450,66 @@ static void test_text_field(void)
     key(KEY_ENTER, 0);
     field_frame();
     CHECK((field_out & KIT_SUBMITTED) && kit_focused() == 0);
+    /* A backlog of typing (each character a key and its text) keeps its order, and Enter after 40 keys still counts */
+    field[0] = 0;
+    click(140, 8);
+    field_frame();
+    const char *typed = "ab\bc";
+    for (const char *c = typed; *c; c++)
+    {
+        key(*c == '\b' ? KEY_BACKSPACE : *c - 'a' + 'A', 0);
+        if (*c != '\b')
+            type((char[2]){ *c, 0 });
+    }
+    for (int i = 0; i < 40; i++)
+        key(KEY_SHIFT, 0);
+    key(KEY_ENTER, 0);
+    int submitted = 0;
+    for (int f = 0; f < 8; f++)
+    {
+        field_frame();
+        submitted |= field_out & KIT_SUBMITTED;
+    }
+    CHECK(!strcmp(field, "ac") && submitted);
+    /* A number takes typing after a click, even a press and release in one frame */
+    float num = 100;
+    for (int f = 0; f < 4; f++)
+    {
+        if (f == 1)
+            click(20, 8);
+        if (f == 2)
+            type("50");
+        if (f == 3)
+            key(KEY_ENTER, 0);
+        kit_begin(win, now);
+        kit_area(rect_make(0, 0, 400, 300), 0, 0);
+        kit_number("num", &num, 1, 1000, 60);
+        kit_area_end();
+        kit_end();
+        if (f == 2)
+            CHECK(num == 50);   /* while typing, as egui's DragValue (linked fields follow at once) */
+    }
+    CHECK(num == 50);
+    /* Tab moves on to the next number */
+    float num2 = 7;
+    for (int f = 0; f < 5; f++)
+    {
+        if (f == 1)
+            click(20, 8);
+        if (f == 2)
+            key(KEY_TAB, 0);
+        if (f == 3)
+            type("9");
+        if (f == 4)
+            key(KEY_ENTER, 0);
+        kit_begin(win, now);
+        kit_area(rect_make(0, 0, 400, 300), 0, 0);
+        kit_number("num", &num, 1, 1000, 60);
+        kit_number("num2", &num2, 1, 1000, 60);
+        kit_area_end();
+        kit_end();
+    }
+    CHECK(num == 50 && num2 == 9 && kit_focused() == 0);
     /* Typing with nothing focused goes to the app */
     type("x");
     kit_begin(win, now);

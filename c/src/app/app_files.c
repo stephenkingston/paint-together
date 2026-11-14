@@ -440,6 +440,13 @@ void app_paste_from(app *a)
 
 void app_ask_path_ok(app *a, const char *path)
 {
+    /* ~ is the home folder, as the field's hint and a shell have it */
+    char home[1100];
+    if (path[0] == '~' && (path[1] == '/' || path[1] == '\\'))
+    {
+        snprintf(home, sizeof home, "%s%s", os_home_dir(), path + 1);
+        path = home;
+    }
     int kind = a->ask_kind;
     a->ask_kind = ASK_NONE;
     pending then = a->ask_then;

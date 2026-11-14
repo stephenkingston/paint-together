@@ -390,15 +390,17 @@ static int door_notices(app *a)
     return start - bottom;
 }
 
-/* Notices fading out over the bottom of the picture, above the door notices (Rust: paint_toasts) */
-static void toasts(app *a, int lift)
+/* Notices fading out over the bottom of the picture, above the door notices and
+ * on top of everything else, menus and dialogs too (Rust: paint_toasts) */
+static int toasts_lift;
+
+static void paint_toasts(void *arg)
 {
-    if (!a->n_toasts)
-        return;
+    const app *a = arg;
     surface *d = kit_dst();
     font *f = ui_font(13, 0);
     double now = os_now();
-    int cx = V.view.x + V.view.w / 2, bottom = V.view.y + V.view.h - S(18) - lift;
+    int cx = V.view.x + V.view.w / 2, bottom = V.view.y + V.view.h - S(18) - toasts_lift;
     for (int i = a->n_toasts - 1; i >= 0; i--)
     {
         const toast *t = &a->toasts[i];
@@ -413,6 +415,13 @@ static void toasts(app *a, int lift)
         bottom -= h + S(6);
     }
     kit_repaint_after(0.05);
+}
+
+static void toasts(app *a, int lift)
+{
+    toasts_lift = lift;
+    if (a->n_toasts)
+        kit_on_top(paint_toasts, a);
 }
 
 /* ---- the frame (Rust: PaintApp::ui) ---- */

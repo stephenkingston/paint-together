@@ -802,7 +802,6 @@ static void build(void)
         join_dialog();
     if (app.edit_colors)
         edit_colors_dialog();
-    kit_draw_toasts(app.view.x + app.view.w / 2, app.view.y + app.view.h - S(18));
 }
 
 /* ---- driving it ---- */

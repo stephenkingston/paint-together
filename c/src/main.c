@@ -176,6 +176,9 @@ int main(int argc, char **argv)
 #if defined(__GLIBC__)
     /* One malloc arena: the network threads otherwise get their own, each holding memory */
     mallopt(M_ARENA_MAX, 1);
+    /* Big blocks (pictures, undo steps) from the system and back to it when freed: glibc's
+     * sliding threshold would otherwise keep tens of MB in the heap after a big picture goes */
+    mallopt(M_MMAP_THRESHOLD, 128 * 1024);
 #endif
 #ifdef _WIN32
     argv = utf8_argv(&argc);

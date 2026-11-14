@@ -187,7 +187,7 @@ void app_push_patch(app *a, const img *before, irect r)
 /* A new picture replaced the old one as one undo step */
 static void record_replace(app *a, img *before)
 {
-    app_record(a, change_replace(before, img_dup(a->img)));
+    app_record(a, change_replace(before, a->img));
     a->dirty_full = 1;
 }
 
@@ -754,7 +754,7 @@ void app_commit_selection(app *a)
     {
         img *before = float_take_before(f);
         if (f->canvas_changed)
-            app_record(a, change_replace(before, img_dup(a->img)));
+            app_record(a, change_replace(before, a->img));
         else
         {
             app_push_patch(a, before, irect_union(f->origin, sel->rect));

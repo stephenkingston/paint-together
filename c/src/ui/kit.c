@@ -167,9 +167,20 @@ void kit_begin(surface *window, double now)
     K.n_keys = 0;
     K.text[0] = 0;
     K.text_taken = 0;
+    int was_x = K.in.x, was_y = K.in.y;
     for (int i = 0; i < K.n_ev; i++)
     {
         const ui_event *e = &K.ev[i];
+        /* A busy moment's backlog is taken over several frames: a frame sums up one click
+         * (two would both be lost), handles its keys before its typed text (a key after
+         * text waits, so typing keeps its order) and holds MAX_KEYS keys */
+        if ((e->type == EV_DOWN && (K.down || K.up)) || (e->type == EV_KEY && (K.text[0] || K.n_keys == MAX_KEYS)))
+        {
+            K.nq = K.n_ev - i;
+            memcpy(K.queue, e, (size_t)K.nq * sizeof *K.queue);
+            K.n_ev = i;
+            break;
+        }
         K.in.mods = e->mods;
         switch (e->type)
         {
@@ -231,6 +242,8 @@ void kit_begin(surface *window, double now)
             break;
         }
     }
+    K.move_dx = K.in.x - was_x;
+    K.move_dy = K.in.y - was_y;
     K.hover_layer = K.in.inside ? layer_at(K.in.x, K.in.y) : -1;
     K.down_layer = K.down ? layer_at(K.down_x, K.down_y) : -1;
     K.down_claimed = 0;
@@ -251,13 +264,13 @@ void kit_begin(surface *window, double now)
                 break;
             }
         }
-    /* Escape closes the top popup, else dismisses the top modal window */
+    /* Escape closes the popups, all of them as egui's do, else dismisses the top modal window */
     for (int i = 0; i < K.n_keys; i++)
         if (K.keys[i].key == KEY_ESCAPE && !K.keys[i].taken)
         {
             if (K.n_open)
             {
-                K.n_open--;
+                close_popups_from(0);
                 K.keys[i].taken = 1;
             }
             else
@@ -281,6 +294,7 @@ void kit_begin(surface *window, double now)
     K.n_order = 0;
     K.again = 0;
     K.tip_seen = 0;
+    K.on_top = NULL;
     for (int i = 0; i < MAX_SLOTS; i++)
         K.slots[i].alive = 0;
     K.nl = 0;
@@ -344,18 +358,27 @@ int kit_end(void)
         gfx_shadow(w, o->r, S(o->shadow_dx), S(o->shadow_dy), S(o->shadow_blur), COLOR_A(0, o->shadow_alpha));
         gfx_copy(w, o->s, o->r);
     }
-    K.n_prev = K.n_order;
-    memcpy(K.prev_order, K.order, sizeof K.order);
+    /* The next frame's input goes by what is shown: not the popups closed while they were built */
+    K.n_prev = 0;
+    for (int k = 0; k < K.n_order; k++)
+        if (!K.slots[K.order[k]].popup || popup_depth(K.slots[K.order[k]].id) >= 0)
+            K.prev_order[K.n_prev++] = K.order[k];
     for (int i = 0; i < MAX_SLOTS; i++)
         if (!K.slots[i].alive && K.slots[i].s)
         {
             surface_free(K.slots[i].s);
             memset(&K.slots[i], 0, sizeof K.slots[i]);
         }
+    if (K.on_top)
+    {
+        K.dst = w;
+        K.on_top(K.on_top_arg);
+    }
     tooltip_draw();
     if (K.again)
         kit_repaint();
-    return K.again;
+    /* With input held back for the next frame, that frame does the redraw (and takes the input) */
+    return K.again && !K.nq;
 }
 
 /* ---- input ---- */
@@ -705,6 +728,7 @@ kit_resp kit_interact_off(rect r, kit_id id, int sense, int enabled)
     if (!enabled)
     {
         res.hovered = 0;
+        K.last = res;
         return res;
     }
     if (sense && K.down && !K.down_claimed && K.down_layer == K.layer && rect_has(vis, K.down_x, K.down_y))
@@ -741,7 +765,13 @@ kit_resp kit_interact_off(rect r, kit_id id, int sense, int enabled)
         }
     }
     res.focused = K.focus == id;
+    K.last = res;
     return res;
+}
+
+const kit_resp *kit_last(void)
+{
+    return &K.last;
 }
 
 kit_resp kit_interact(rect r, kit_id id, int sense)
@@ -753,6 +783,8 @@ void kit_focus(kit_id id)
 {
     K.focus = id;
     K.focus_seen = 1;
+    /* Given on a click whose press is in this same frame (a quick tap): that press doesn't take it away */
+    K.press_focus = id;
 }
 
 kit_id kit_focused(void)
@@ -809,7 +841,7 @@ void tooltip_draw(void)
     {
         const char *nl = strchr(s, '\n');
         int n = nl ? (int)(nl - s) : (int)strlen(s);
-        int w = text_width(f, s, n);
+        int w = text_width(f, s, n) + 1;    /* (rounded to nearest: text_wrap mustn't find it too narrow) */
         if (w > tw)
             tw = w;
         s += n + (nl != NULL);
@@ -958,7 +990,9 @@ void kit_popup_toggle(kit_id anchor)
         popup_open_here(anchor, rect_make(0, 0, 0, 0));
 }
 
-static int popup_begin(kit_id id, rect anchor, int below, int width_pt, int flags)
+/* A popup below `anchor`, or `beside` it: to the right with its first row
+ * level with the anchor (egui's RectAlign::RIGHT_START), else to the left */
+static int popup_begin(kit_id id, rect anchor, int beside, int width_pt, int flags)
 {
     int d = popup_depth(id);
     if (d < 0)
@@ -973,9 +1007,18 @@ static int popup_begin(kit_id id, rect anchor, int below, int width_pt, int flag
     int w = S((float)width_pt) + 2 * edge;
     rect scr = kit_screen();
     int h = o->fresh ? scr.h : o->r.h;
-    rect r = rect_make(anchor.x, below ? anchor.y + anchor.h : anchor.y, w, h);
+    rect r = rect_make(anchor.x, anchor.y + anchor.h, w, h);
     if (!o->fresh && r.y + h > scr.h && anchor.y - h >= 0)
-        r.y = (below ? anchor.y : anchor.y) - h;     /* no room below: above the anchor */
+        r.y = anchor.y - h;     /* no room below: above the anchor */
+    if (beside)
+    {
+        int gap = S(MENU_MARGIN + 3);
+        r = rect_make(anchor.x + anchor.w + gap, anchor.y - edge, w, h);
+        if (r.x + w > scr.w && anchor.x - gap - w >= 0)
+            r.x = anchor.x - gap - w;
+        if (!o->fresh && r.y + h > scr.h)
+            r.y = anchor.y + anchor.h + edge - h;   /* no room below: its last row level with the anchor */
+    }
     if (o->fresh)
         r.h = scr.h - r.y > S(40) ? scr.h - r.y : scr.h;
     o->modal = 0;
@@ -992,7 +1035,7 @@ static int popup_begin(kit_id id, rect anchor, int below, int width_pt, int flag
     K.popups[K.n_popups].close = 0;
     K.n_popups++;
     kit_push_n((int)id);
-    kit_area(rect_make(r.x + edge, r.y + edge, w - 2 * edge, scr.h), 0, 0);
+    kit_area(rect_make(r.x + edge, r.y + edge, w - 2 * edge, scr.h), 0, ITEM_SPACING_Y);
     return 1;
 }
 
@@ -1005,7 +1048,8 @@ int kit_popup_menu(const kit_resp *anchor, int width_pt, int flags)
         else
             popup_open_here(anchor->id, anchor->r);
     }
-    return popup_begin(anchor->id, anchor->r, 1, width_pt, flags);
+    /* egui's Popup::width is the whole menu's, frame and margins too */
+    return popup_begin(anchor->id, anchor->r, 0, width_pt ? width_pt - 2 * (MENU_MARGIN + 1) : 0, flags);
 }
 
 int kit_context_menu(const kit_resp *on, int width_pt)
@@ -1017,7 +1061,75 @@ int kit_context_menu(const kit_resp *on, int width_pt)
     if (d < 0)
         return 0;
     rect at = K.open[d].anchor;
-    return popup_begin(id, at, 1, width_pt, 0);
+    return popup_begin(id, at, 0, width_pt, 0);
+}
+
+/* Whether the pointer is heading for r: the ray along its last move meets it (egui's is_moving_towards_rect) */
+static int heading_for(rect r)
+{
+    float o[2] = { (float)K.in.x, (float)K.in.y }, d[2] = { (float)K.move_dx, (float)K.move_dy };
+    float lo[2] = { (float)r.x, (float)r.y }, hi[2] = { (float)(r.x + r.w), (float)(r.y + r.h) };
+    float t0 = 0, t1 = 1e30f;
+    if (!d[0] && !d[1])
+        return 0;
+    for (int i = 0; i < 2; i++)
+    {
+        if (!d[i])
+        {
+            if (o[i] < lo[i] || o[i] > hi[i])
+                return 0;
+            continue;
+        }
+        float a = (lo[i] - o[i]) / d[i], b = (hi[i] - o[i]) / d[i];
+        t0 = fmaxf(t0, fminf(a, b));
+        t1 = fminf(t1, fmaxf(a, b));
+    }
+    return t0 <= t1;
+}
+
+int kit_submenu(const char *label, int width_pt)
+{
+    if (!K.n_popups)
+        return 0;
+    const popup *parent = &K.popups[K.n_popups - 1];
+    rect b = kit_alloc_px(kit_avail().w, S(INTERACT_H));
+    kit_resp res = kit_interact(b, kit_id_of(label), SENSE_CLICK);
+    kit_id id = mix_id(res.id, "submenu", 0);
+    int d = popup_depth(id);
+    /* The row reaches halfway into the spacing around it, so the gaps don't close it */
+    int hx = S(ITEM_SPACING_X) / 2, hy = S(ITEM_SPACING_Y) / 2;
+    int on_row = K.hover_layer == K.layer && rect_has(rect_make(b.x - hx, b.y - hy, b.w + 2 * hx, b.h + 2 * hy), K.in.x, K.in.y);
+    if (d < 0 && (res.clicked || (on_row && K.n_open == parent->depth + 1)))
+    {
+        popup_open_here(id, b);
+        d = popup_depth(id);
+    }
+    else if (d >= 0 && !on_row)
+    {
+        /* Open, and the pointer is on another row of this menu, not on its way to the submenu: it closes */
+        int s = slot_find(id), edge = 1 + S(MENU_MARGIN);
+        rect sub = s >= 0 ? K.slots[s].r : rect_make(0, 0, 0, 0);
+        int on_menu = K.hover_layer == K.layer && rect_has(rect_inset(K.slots[parent->slot].r, edge), K.in.x, K.in.y);
+        int heading = heading_for(sub);
+        if (heading)
+            kit_repaint_after(0.1);     /* look again when it stops */
+        if (on_menu && !heading && !rect_has(sub, K.in.x, K.in.y))
+        {
+            close_popups_from(d);
+            d = -1;
+        }
+    }
+    /* egui's button in menu style: no frame; the open one keeps a pressed fill */
+    color fill = res.held ? VIS_ACTIVE_BG : res.hovered ? VIS_HOVER_BG : d >= 0 ? VIS_ACTIVE_BG : 0;
+    if (fill)
+        gfx_fill(K.dst, b, fill);
+    text_in(K.dst, ui_font(FONT_BODY, 0), rect_make(b.x + S(2), b.y, b.w - S(4), b.h), ALIGN_LEFT, label, PAL_TEXT);
+    float tip = b.x + b.w - SF(5), cy = b.y + b.h / 2.0f;
+    float tri[6] = { tip - SF(4.5f), cy - SF(4), tip, cy, tip - SF(4.5f), cy + SF(4) };
+    gfx_polygon(K.dst, tri, 3, PAL_TEXT);
+    if (d < 0 || !popup_begin(id, b, 1, width_pt, POPUP_SUB))
+        return 0;
+    return 1;
 }
 
 void kit_popup_close(void)
@@ -1039,11 +1151,15 @@ void kit_popup_end(void)
     if (r.w < o->assumed.w && used.w == 0)
         r.w = o->assumed.w;
     gfx_frame(o->s, r, HAIR(), VIS_WINDOW_STROKE);
-    /* A click inside closes it, unless it stays open for more */
-    int clicked_inside = K.up && rect_has(o->r, K.up_x, K.up_y) && rect_has(o->r, K.down_x, K.down_y) && K.down;
+    /* A click inside closes it, unless it stays open for more or one of its submenus is open */
+    int clicked_inside = K.up && rect_has(o->r, K.up_x, K.up_y) && rect_has(o->r, K.down_x, K.down_y) && K.down && K.n_open <= p->depth + 1;
     layer_end(p->slot, r);
     if (p->close || (clicked_inside && !(p->flags & POPUP_STAY_OPEN)))
+    {
         close_popups_from(p->depth);
+        if (p->flags & POPUP_SUB && K.n_popups)
+            K.popups[K.n_popups - 1].close = 1;     /* a pick in a submenu closes the menus it came from */
+    }
 }
 
 void kit_overlay_begin(const char *id, rect r, int frame)
@@ -1249,40 +1365,10 @@ void kit_dialog_end(void)
     win_end();
 }
 
-/* ---- toasts ---- */
+/* ---- on top ---- */
 
-void kit_toast(const char *text, double seconds)
+void kit_on_top(void (*draw)(void *arg), void *arg)
 {
-    if (K.n_toasts == MAX_TOASTS)
-    {
-        memmove(&K.toasts[0], &K.toasts[1], sizeof K.toasts[0] * (MAX_TOASTS - 1));
-        K.n_toasts--;
-    }
-    snprintf(K.toasts[K.n_toasts].text, sizeof K.toasts[0].text, "%s", text);
-    K.toasts[K.n_toasts].until = K.now + seconds;
-    K.n_toasts++;
-    kit_repaint();
-}
-
-void kit_draw_toasts(int cx, int bottom)
-{
-    int keep = 0;
-    for (int i = 0; i < K.n_toasts; i++)
-        if (K.toasts[i].until > K.now)
-            K.toasts[keep++] = K.toasts[i];
-    K.n_toasts = keep;
-    if (!keep)
-        return;
-    font *f = ui_font(13, 0);
-    for (int i = K.n_toasts - 1; i >= 0; i--)
-    {
-        double fade = (K.toasts[i].until - K.now) / 0.5;
-        fade = fade < 0 ? 0 : fade > 1 ? 1 : fade;
-        int w = text_width(f, K.toasts[i].text, -1) + S(28), h = font_height(f) + S(12);
-        rect pill = rect_make(cx - w / 2, bottom - S(14) - h / 2, w, h);
-        gfx_round(K.dst, pill, S(14), COLOR_A(0x282830, (int)(215 * fade)));
-        text_in(K.dst, f, pill, ALIGN_CENTER, K.toasts[i].text, COLOR_A(0xFFFFFF, (int)(255 * fade)));
-        bottom -= h + S(6);
-    }
-    kit_repaint_after(0.05);
+    K.on_top = draw;
+    K.on_top_arg = arg;
 }

@@ -607,7 +607,14 @@ const char *os_config_dir(void)
     if (!dir[0])
     {
         wchar_t buf[MAX_PATH];
-        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, buf)))
+        const wchar_t *o = _wgetenv(L"PAINT_CONFIG_DIR");    /* the tests keep their own settings */
+        if (o && *o)
+        {
+            char *s = narrow(o);
+            snprintf(dir, sizeof dir, "%s", s);
+            free(s);
+        }
+        else if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, buf)))
         {
             char *s = narrow(buf);
             snprintf(dir, sizeof dir, "%s\\Paint", s);

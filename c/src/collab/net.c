@@ -731,13 +731,7 @@ link *link_host_with(os_sock sock, hub *h, const char *name, const uint8_t color
     t->wake = wake;
     os_thread_detach(os_thread_start(hub_main, t));
 
-    listener *L = calloc(1, sizeof *L);
-    L->sock = sock;
-    L->hub = chan_ref(l->hub);
-    L->next_id = 2;
-    L->wake = wake;
-    os_thread_detach(os_thread_start(listen_main, L));
-
+    /* I join first, so the hub makes me its host: on a takeover, friends may already be waiting at the door */
     char addr[32];
     os_addr_format((os_addr){ net_lan_ip(), l->port }, addr, sizeof addr);
     hub_event *join = calloc(1, sizeof *join);
@@ -748,6 +742,13 @@ link *link_host_with(os_sock sock, hub *h, const char *name, const uint8_t color
     memcpy(join->color, color, 3);
     join->sink = (sink){ l->me, 1, chan_ref(l->events) };
     chan_push(l->hub, join);
+
+    listener *L = calloc(1, sizeof *L);
+    L->sock = sock;
+    L->hub = chan_ref(l->hub);
+    L->next_id = 2;
+    L->wake = wake;
+    os_thread_detach(os_thread_start(listen_main, L));
     return l;
 }
 

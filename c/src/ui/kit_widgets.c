@@ -521,7 +521,8 @@ int kit_number(const char *id, float *value, float min, float max, int width_pt)
         if (K.te_id != nid)
             snprintf(K.num_buf, sizeof K.num_buf, "%.0f", *value);
         int out = field(nid, box, K.num_buf, sizeof K.num_buf, 9, NULL, FIELD_DIGITS, 1);
-        if (out & KIT_LOST_FOCUS)
+        /* the value follows the typing (egui's update_while_editing), so linked fields update at once */
+        if (out & (KIT_LOST_FOCUS | KIT_CHANGED))
         {
             float v = K.num_buf[0] ? (float)atof(K.num_buf) : *value;
             v = v < min ? min : v > max ? max : v;
@@ -530,7 +531,9 @@ int kit_number(const char *id, float *value, float min, float max, int width_pt)
         }
         return changed;
     }
-    /* Not editing: drag across to change it, click to type */
+    /* Not editing: drag across to change it, click (or Tab) to type */
+    if (K.n_focusable < MAX_FOCUSABLE)
+        K.focusable[K.n_focusable++] = nid;
     kit_resp r = kit_interact(box, nid, SENSE_DRAG);
     kit_hover_cursor(&r, CURSOR_SIZE_EW);
     if (r.drag_started)
@@ -716,8 +719,7 @@ int kit_combo(const char *id, const char *shown, int width_pt, int list_h_pt)
     float cx = box.x + box.w - SF(15), cy = box.y + box.h / 2.0f;
     float tri[6] = { cx - SF(5), cy - SF(3), cx + SF(5), cy - SF(3), cx, cy + SF(3) };
     gfx_polygon(K.dst, tri, 3, PAL_TEXT);
-    int edge = MENU_MARGIN + 1;
-    if (!kit_popup_menu(&r, width_pt - 2 * edge, 0))
+    if (!kit_popup_menu(&r, width_pt, 0))
     {
         if (K.combo_id == cid)
             K.combo_id = 0;

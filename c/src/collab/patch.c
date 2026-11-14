@@ -226,38 +226,62 @@ int edit_valid(const edit *e)
     return e->kind == EDIT_PATCH ? patch_valid(&e->p) : picture_valid(&e->pic);
 }
 
-/* A patch over the change's rectangle: each pixel `to` shows where it differs from
- * `from` (and, when `current` is given, only where current still shows `from`) */
-static int change_patch_edit(const change *c, irect r, const img *from, const img *to, const img *current, edit *out)
+typedef struct
+{
+    builder b;
+    irect r;                /* where the patch goes: within the change's rectangle */
+    int x, y, undo;         /* the change's corner; undo: from its after side to its before side */
+    const img *current;
+    size_t i;
+} diff_ctx;
+
+static void diff_row(int y, const uint8_t *before, const uint8_t *after, void *user)
+{
+    diff_ctx *d = user;
+    int py = d->y + y;
+    if (py < d->r.y0 || py >= d->r.y1)
+        return;
+    const uint8_t *from = d->undo ? after : before, *to = d->undo ? before : after;
+    for (int x = d->r.x0; x < d->r.x1; x++, d->i++)
+    {
+        const uint8_t *f = from + (size_t)(x - d->x) * 4, *t = to + (size_t)(x - d->x) * 4;
+        if (memcmp(f, t, 4) && (!d->current || !memcmp(img_at(d->current, x, py), f, 4)))
+            builder_add(&d->b, d->i, t);
+    }
+}
+
+/* A patch over r (within the change's rectangle): each pixel the change's `to` side shows where it
+ * differs from its `from` side (and, when `current` is given, only where current still shows `from`) */
+static int change_patch_edit(const change *c, irect r, int undo, const img *current, edit *out)
 {
     memset(out, 0, sizeof *out);
     if (irect_empty(r))
         return 0;
-    builder b;
-    builder_start(&b, r);
-    size_t i = 0;
-    for (int y = r.y0; y < r.y1; y++)
-        for (int x = r.x0; x < r.x1; x++, i++)
-        {
-            const uint8_t *f = img_at(from, x - c->x, y - c->y), *t = img_at(to, x - c->x, y - c->y);
-            if (memcmp(f, t, 4) && (!current || !memcmp(img_at(current, x, y), f, 4)))
-                builder_add(&b, i, t);
-        }
+    diff_ctx d = { .r = r, .x = c->x, .y = c->y, .undo = undo, .current = current };
+    builder_start(&d.b, r);
+    change_rows(c, 3, diff_row, &d);
     out->kind = EDIT_PATCH;
-    return builder_finish(&b, &out->p);
+    return builder_finish(&d.b, &out->p);
+}
+
+/* A whole-picture edit showing one side of the change */
+static int change_picture_edit(const change *c, int after, edit *out)
+{
+    memset(out, 0, sizeof *out);
+    img *im = change_image(c, after);
+    if (!im)
+        return 0;
+    out->kind = EDIT_REPLACE;
+    out->pic = (picture){ (uint32_t)im->w, (uint32_t)im->h, im->px, (size_t)im->w * im->h * 4 };
+    free(im);               /* the pixels now belong to the edit */
+    return 1;
 }
 
 int edit_from_change(const change *c, edit *out)
 {
     if (c->kind == CHANGE_REPLACE)
-    {
-        memset(out, 0, sizeof *out);
-        out->kind = EDIT_REPLACE;
-        out->pic = picture_of(c->after);
-        return 1;
-    }
-    irect r = irect_make(c->x, c->y, c->x + c->after->w, c->y + c->after->h);
-    return change_patch_edit(c, r, c->before, c->after, NULL, out);
+        return change_picture_edit(c, 1, out);
+    return change_patch_edit(c, irect_make(c->x, c->y, c->x + c->aw, c->y + c->ah), 0, NULL, out);
 }
 
 region edit_region(const edit *e, const img *im)
@@ -288,14 +312,8 @@ void edit_apply(const edit *e, img **im)
 
 int collab_revert(const change *c, const img *current, int undo, edit *out)
 {
-    const img *from = undo ? c->after : c->before, *to = undo ? c->before : c->after;
     if (c->kind == CHANGE_REPLACE)
-    {
-        memset(out, 0, sizeof *out);
-        out->kind = EDIT_REPLACE;
-        out->pic = picture_of(to);
-        return 1;
-    }
-    irect r = irect_intersect(irect_make(c->x, c->y, c->x + c->after->w, c->y + c->after->h), irect_of(current));
-    return change_patch_edit(c, r, from, to, current, out);
+        return change_picture_edit(c, !undo, out);
+    irect r = irect_intersect(irect_make(c->x, c->y, c->x + c->aw, c->y + c->ah), irect_of(current));
+    return change_patch_edit(c, r, undo, current, out);
 }

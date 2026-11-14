@@ -10,6 +10,7 @@
 #include "collab/names.h"
 #include "collab/net.h"
 #include "collab/session.h"
+#include "paint/raster.h"
 
 static int failures;
 #define CHECK(c)                                                                  \
@@ -334,15 +335,16 @@ static void test_patches(void)
     CHECK(patch_diff(before, before, irect_make(0, 0, 8, 8), &p) == 0);
 
     /* A change made by me, then a friend paints over part of it: undo restores only my own pixels */
-    img *b = img_crop(before, 0, 0, 4, 1), *a = img_new(4, 1, (rgba){ 9, 9, 9, 255 });
-    change c = { CHANGE_PATCH, 2, 3, b, a };
+    img *mine = white(8, 8);
+    raster_fill_rect(mine, irect_make(2, 3, 6, 4), (rgba){ 9, 9, 9, 255 });
+    change *c = change_patch(before, mine, irect_make(2, 3, 6, 4));
     edit e;
-    CHECK(edit_from_change(&c, &e) == 1 && e.kind == EDIT_PATCH && e.p.pixels_len == 16);
+    CHECK(edit_from_change(c, &e) == 1 && e.kind == EDIT_PATCH && e.p.pixels_len == 16);
     img *current = white(8, 8);
     edit_apply(&e, &current);
     memcpy(img_at(current, 3, 3), "\x00\x00\x00\xFF", 4);       /* the friend's pixel */
     edit undo;
-    CHECK(collab_revert(&c, current, 1, &undo) == 1);
+    CHECK(collab_revert(c, current, 1, &undo) == 1);
     edit_apply(&undo, &current);
     CHECK(!memcmp(img_at(current, 2, 3), "\xFF\xFF\xFF\xFF", 4) && !memcmp(img_at(current, 3, 3), "\x00\x00\x00\xFF", 4));
     CHECK(!memcmp(img_at(current, 5, 3), "\xFF\xFF\xFF\xFF", 4));
@@ -350,8 +352,8 @@ static void test_patches(void)
     CHECK(!g.whole && g.r.x0 == 2 && g.r.x1 == 6 && g.r.y0 == 3 && g.r.y1 == 4);
     edit_free(&undo);
     edit_free(&e);
-    img_free(a);
-    img_free(b);
+    change_free(c);
+    img_free(mine);
     img_free(current);
     img_free(copy);
     img_free(before);

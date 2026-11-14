@@ -204,6 +204,125 @@ static void test_selection_menu_and_ants(void)
     key(KEY_ESCAPE, 0);
 }
 
+/* The selection menu's Rotate opens beside it on hover, stays open on the way
+ * there, closes when another row is hovered, and a pick closes both */
+static void test_selection_submenu(void)
+{
+    reset(100);
+    app_set_tool(A, TOOL_SELECT);
+    int x0, y0, x1, y1;
+    to_screen(50, 50, &x0, &y0);
+    to_screen(200, 150, &x1, &y1);
+    drag(x0, y0, x1, y1);
+    click(x0 + 20, y0 + 20, BTN_RIGHT);
+    /* Rotate's row: below the frame and margin, 6 rows and 2 separators (each with its spacing) */
+    int mx = x0 + 20, row_y = y0 + 20 + 1 + S(7) + 6 * S(31) + 2 * S(11) + S(11);
+    move_to(mx + S(60), row_y);
+    move_to(mx + S(62), row_y + 1);
+    int beside = mx + S(214) + S(40);
+    CHECK(!kit_free_at(beside, row_y), "the Rotate submenu isn't open beside the menu");
+    CHECK(kit_free_at(mx + S(60), row_y + S(140)), "the submenu opened below its row");
+    shot("selection-submenu");
+    /* On its way there over the row below, it stays open */
+    send(EV_MOVE, mx + S(150), row_y + S(20), 0);
+    frame();
+    CHECK(!kit_free_at(beside, row_y), "the submenu closed on the way to it");
+    /* Resting on another row closes it, but not the menu */
+    clock_now += 0.2;
+    move_to(mx + S(60), row_y + S(31));
+    clock_now += 0.2;
+    kit_repaint();
+    frame();
+    CHECK(kit_free_at(beside, row_y), "the submenu stayed open over another row");
+    CHECK(!kit_free_at(mx + S(60), row_y), "the menu closed");
+    /* Open it again and pick Rotate right: both menus close, the selection turns */
+    move_to(mx + S(60), row_y);
+    move_to(beside, row_y + 2);
+    irect before = A->sel->rect;
+    click(beside, row_y + 2, BTN_LEFT);
+    CHECK(kit_free_at(beside, row_y) && kit_free_at(mx + S(60), row_y), "a pick in the submenu left a menu open");
+    CHECK(A->sel && A->sel->rect.x1 - A->sel->rect.x0 == before.y1 - before.y0, "the selection didn't turn");
+    /* Escape closes both menus at once, as egui's popups do */
+    click(x0 + 20, y0 + 20, BTN_RIGHT);
+    move_to(mx + S(60), row_y);
+    move_to(mx + S(62), row_y + 1);
+    CHECK(!kit_free_at(beside, row_y), "the submenu didn't open again");
+    key(KEY_ESCAPE, 0);
+    CHECK(kit_free_at(beside, row_y) && kit_free_at(mx + S(60), row_y), "Escape left a menu open");
+}
+
+/* The ribbon's drop-down menus have egui's spacing between their rows */
+static void test_ribbon_menus(void)
+{
+    reset(100);
+    click(222, 112, BTN_LEFT);
+    CHECK(!kit_free_at(230, 125 + 5 * 31 - 10), "the Rotate menu is too short");
+    shot("ribbon-rotate-menu");
+    click(152, 116, BTN_LEFT);
+    CHECK(kit_free_at(375, 200), "opening the Select menu left the Rotate menu open");
+    shot("ribbon-select-menu");
+    key(KEY_ESCAPE, 0);
+}
+
+/* The Together tab's check box and name field have tooltips */
+static void test_together_tooltips(void)
+{
+    reset(100);
+    A->tab = TAB_TOGETHER;
+    frame();
+    /* where the check box's text and the name field are */
+    static const struct
+    {
+        int x, y;
+        const char *name;
+    } at[2] = { { 165, 80, "together-tip-let-in" }, { 455, 72, "together-tip-name" } };
+    for (int i = 0; i < 2; i++)
+    {
+        int x = S(at[i].x), y = S(at[i].y);
+        move_to(x, y);
+        clock_now += 0.6;
+        kit_repaint();
+        frame();
+        shot(at[i].name);
+    }
+}
+
+/* Toasts are drawn over menus and dialogs, and leave them their input */
+static void test_toasts_on_top(void)
+{
+    reset(100);
+    snprintf(A->toasts[0].text, sizeof A->toasts[0].text, "Happy Otter joined");
+    A->toasts[0].until = os_now() + 30;
+    A->n_toasts = 1;
+    app_set_tool(A, TOOL_SELECT);
+    frame();
+    rect v = V.view;
+    int tx = v.x + v.w / 2, ty = v.y + v.h - S(18) - S(14);
+    int dark = 0;
+    for (int dx = -S(60); dx <= S(60); dx++)
+        dark |= (win->px[ty * win->w + tx + dx] & 0xFF) < 0x60;
+    CHECK(dark, "no toast");
+    /* A right-click menu over the toast: the toast still shows, the menu takes the clicks */
+    A->menu_open = 1;
+    send(EV_MOVE, tx - S(100), ty - S(250), 0);
+    send(EV_UP, tx - S(100), ty - S(250), BTN_RIGHT);
+    frame();
+    frame();
+    CHECK(!kit_free_at(tx - S(90), ty), "the menu doesn't cover the toast");
+    dark = 0;
+    for (int dx = -S(60); dx <= S(60); dx++)
+        dark |= (win->px[ty * win->w + tx + dx] & 0xFF) < 0x60;
+    CHECK(dark, "the toast is under the menu");
+    shot("toast-over-menu");
+    key(KEY_ESCAPE, 0);
+    A->about_open = 1;
+    frame();
+    frame();
+    shot("toast-over-dialog");
+    A->about_open = 0;
+    A->n_toasts = 0;
+}
+
 static void test_text(void)
 {
     reset(100);
@@ -318,6 +437,13 @@ static void test_view_tab_rulers_and_zoom(void)
     frame();
     frame();
     shot("thumbnail");
+    /* A tall picture that fits across gets the vertical scroll bar only */
+    A->show_rulers = A->show_thumbnail = 0;
+    frame();
+    rect fits = A->view;
+    app_rotate(A, ROTATE_RIGHT);
+    frame();
+    CHECK(A->view.h == fits.h && A->view.w < fits.w, "view %dx%d, was %dx%d", A->view.w, A->view.h, fits.w, fits.h);
 }
 
 static kid make_kid(peer_id id, const char *name, uint8_t r, uint8_t g, uint8_t b)
@@ -374,6 +500,10 @@ int main(int argc, char **argv)
     test_pencil_draws_through_the_canvas();
     test_shape_then_move();
     test_selection_menu_and_ants();
+    test_selection_submenu();
+    test_ribbon_menus();
+    test_together_tooltips();
+    test_toasts_on_top();
     test_text();
     test_file_menu();
     test_dialogs_show();

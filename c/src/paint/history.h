@@ -3,8 +3,11 @@
  *
  * Most edits store only the before/after pixels of the rectangle they
  * touched; edits that change the canvas size store whole pictures. The
- * oldest steps are dropped beyond a 1 GB budget. Each step has an id, so
- * drawing together can tell which steps are still "mine".
+ * pixels are kept packed (runs of one colour, and "unchanged" runs in the
+ * after side), so a fill or a brush stroke costs a small part of its
+ * rectangle; read them back with change_rows or change_image. The oldest
+ * steps are dropped beyond a 1 GB budget of packed bytes. Each step has an
+ * id, so drawing together can tell which steps are still "mine".
  */
 #ifndef PAINT_HISTORY_H
 #define PAINT_HISTORY_H
@@ -22,14 +25,22 @@ typedef struct
 {
     int kind;
     int x, y;
-    img *before, *after;    /* owned */
+    int bw, bh, aw, ah;         /* sizes of the before and after pixels */
+    int delta;                  /* the after side is packed against the before side */
+    uint8_t *before, *after;    /* owned, packed (history.c) */
+    size_t bytes;               /* what the packed pixels take */
 } change;
 
 /* The difference between two same-sized pictures within r, or NULL if nothing changed */
 change *change_patch(const img *before, const img *after, irect r);
-change *change_replace(img *before, img *after);   /* takes ownership of both */
+change *change_replace(img *before, const img *after);    /* takes ownership of before */
 void change_free(change *c);
 void change_apply(const change *c, img **picture, int undo);  /* may replace *picture (CHANGE_REPLACE) */
+/* Unpack a step a row at a time: fn gets row y (0 = top) of the pixels before and after it.
+ * which: 1 before, 2 after, 3 both (only when they are the same size); the side not asked for is NULL */
+void change_rows(const change *c, int which, void (*fn)(int y, const uint8_t *before, const uint8_t *after, void *user),
+                 void *user);
+img *change_image(const change *c, int after);     /* one side unpacked, for the caller to free; NULL if out of memory */
 
 typedef struct history history;
 
