@@ -4,10 +4,10 @@ Also on crates.io: `cargo install paint-together` installs the `paint` command.
 
 ### New in this release
 
-- **Graphics memory is set aside as in 0.3.0 again.** 0.3.1 asked the graphics driver for memory in small blocks, to start up smaller; Paint is back to the usual larger blocks. Everything else that made 0.3.1 lighter stays: the smaller app, fonts loaded only once, and up to 256 MB of undo history.
-- Draws together with 0.3.0 and 0.3.1.
+- **Back to 0.3.0.** This is the same Paint as 0.3.0: everything 0.3.1 and 0.3.2 changed is undone. On Windows, Paint no longer draws with Direct3D 12 or keeps a crash report, and undo history is back to a 1 GB budget.
+- Draws together with 0.3.0, 0.3.1 and 0.3.2.
 
-For everything else that changed recently, see the [0.3.1 release notes](https://github.com/stephenkingston/paint-together/releases/tag/v0.3.1).
+For what 0.3.0 brought (approving who joins, kicking out, and shapes stamping when you pick another), see the [0.3.0 release notes](https://github.com/stephenkingston/paint-together/releases/tag/v0.3.0).
 
 ### Linux (x86_64)
 

@@ -1,6 +1,6 @@
 [package]
 name = "paint-together"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Classic Windows Paint, rebuilt in Rust, where kids on the same Wi-Fi draw on one picture together in real time"
@@ -31,13 +31,6 @@ rfd = "0.17"
 # each font's own name table there.
 [target.'cfg(windows)'.dependencies]
 ttf-parser = "0.25"
-
-[profile.release]
-# A smaller download, and less of it to load into memory: the program is
-# optimized as a whole and keeps no symbols (crash reports still say where).
-lto = "fat"
-codegen-units = 1
-strip = true
 
 [profile.dev]
 opt-level = 1

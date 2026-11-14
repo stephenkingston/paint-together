@@ -380,10 +380,6 @@ pub struct PaintApp {
 
 impl PaintApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>, join: Option<String>) -> Self {
-        if let Some(render) = &cc.wgpu_render_state {
-            let a = render.adapter.get_info();
-            crate::crash::note_graphics(format!("{} ({:?}, {:?}, driver {} {})", a.name, a.backend, a.device_type, a.driver, a.driver_info));
-        }
         let mut app = Self::with_context(cc.egui_ctx.clone(), initial);
         app.lan_discovery = true;
         match load_me() {
@@ -402,8 +398,6 @@ impl PaintApp {
 
     fn with_context(ctx: Context, initial: Option<PathBuf>) -> Self {
         theme::install(&ctx);
-        // Ctrl/⌘ + and − zoom the picture; left on, egui would also grow the whole window's UI.
-        ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let (light, dark) = (Color32::from_gray(255), Color32::from_gray(204));
         let checker = ctx.load_texture(
             "checker",
@@ -2356,7 +2350,7 @@ impl PaintApp {
         let (w, h) = (self.img.width() as usize, self.img.height() as usize);
         let full = self.tex_full || nearest != self.tex_nearest || self.tex.as_ref().is_none_or(|t| t.size() != [w, h]);
         if full {
-            let image = with_friends(&self.img, friends, IRect::of_image(&self.img));
+            let image = ColorImage::from_rgba_unmultiplied([w, h], &with_friends(&self.img, friends, IRect::of_image(&self.img)));
             match &mut self.tex {
                 Some(t) => t.set(image, opts),
                 None => self.tex = Some(ctx.load_texture("canvas", image, opts)),
@@ -2366,7 +2360,9 @@ impl PaintApp {
         } else {
             let r = self.tex_dirty.intersect(IRect::of_image(&self.img));
             if let (false, Some(t)) = (r.is_empty(), &mut self.tex) {
-                t.set_partial([r.x0 as usize, r.y0 as usize], with_friends(&self.img, friends, r), opts);
+                let size = [r.width() as usize, r.height() as usize];
+                let image = ColorImage::from_rgba_unmultiplied(size, &with_friends(&self.img, friends, r));
+                t.set_partial([r.x0 as usize, r.y0 as usize], image, opts);
             }
         }
         self.tex_dirty = IRect::EMPTY;
@@ -4081,22 +4077,27 @@ fn text_handle_at(bounds: Rect, p: Pos2, tol: f32, zoom: f32) -> Option<usize> {
 
 /// The pixels of `r` in `img`, with friends' drawing-in-progress (`overlay`,
 /// transparent where there is none) on top.
-fn with_friends(img: &RgbaImage, overlay: Option<&RgbaImage>, r: IRect) -> ColorImage {
+fn with_friends(img: &RgbaImage, overlay: Option<&RgbaImage>, r: IRect) -> Vec<u8> {
     let (w, rw) = (img.width() as usize, r.width() as usize);
-    let (raw, over) = (img.as_raw(), overlay.filter(|o| o.dimensions() == img.dimensions()).map(|o| o.as_raw()));
-    let color = |p: &[u8]| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]);
-    // Straight into the texture's pixels: a big picture is copied once on its way to the screen, not twice.
-    let mut pixels = Vec::with_capacity(rw * r.height() as usize);
+    let raw = img.as_raw();
+    let mut buf = Vec::with_capacity(rw * r.height() as usize * 4);
     for y in r.y0 as usize..r.y1 as usize {
-        let row = (y * w + r.x0 as usize) * 4..(y * w + r.x1 as usize) * 4;
-        match over {
-            None => pixels.extend(raw[row].chunks_exact(4).map(color)),
-            Some(over) => pixels.extend(
-                raw[row.clone()].chunks_exact(4).zip(over[row].chunks_exact(4)).map(|(mine, theirs)| color(if theirs[3] > 0 { theirs } else { mine })),
-            ),
+        let i = (y * w + r.x0 as usize) * 4;
+        buf.extend_from_slice(&raw[i..i + rw * 4]);
+    }
+    if let Some(over) = overlay.filter(|o| o.dimensions() == img.dimensions()) {
+        let over = over.as_raw();
+        for (row, y) in (r.y0 as usize..r.y1 as usize).enumerate() {
+            for col in 0..rw {
+                let i = (y * w + r.x0 as usize + col) * 4;
+                if over[i + 3] > 0 {
+                    let o = (row * rw + col) * 4;
+                    buf[o..o + 4].copy_from_slice(&over[i..i + 4]);
+                }
+            }
         }
     }
-    ColorImage::new([rw, r.height() as usize], pixels)
+    buf
 }
 
 /// Tools whose mouse pointer is their own icon, as in Paint.
@@ -4468,30 +4469,21 @@ fn local_utc_offset(_secs: i64) -> i64 {
     0
 }
 
-/// Where Paint keeps what it remembers between runs (and its last crash report).
-pub fn settings_dir() -> Option<PathBuf> {
-    // Tests keep their own: they change settings (asking friends first, for one),
-    // which must never land in the settings of whoever runs them.
-    if cfg!(test) {
-        return Some(std::env::temp_dir().join("paint-tests"));
-    }
+fn recent_file() -> Option<PathBuf> {
     if cfg!(windows) {
-        return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Paint (Rust)"));
+        return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Paint (Rust)").join("recent.txt"));
     }
     let home = std::env::var_os("HOME")?;
-    Some(if cfg!(target_os = "macos") {
+    let dir = if cfg!(target_os = "macos") {
         std::path::Path::new(&home).join("Library/Application Support/Paint (Rust)")
     } else {
         std::path::Path::new(&home).join(".config/paint-rust")
-    })
-}
-
-fn recent_file() -> Option<PathBuf> {
-    settings_dir().map(|d| d.join("recent.txt"))
+    };
+    Some(dir.join("recent.txt"))
 }
 
 fn me_file() -> Option<PathBuf> {
-    settings_dir().map(|d| d.join("me.txt"))
+    recent_file().map(|f| f.with_file_name("me.txt"))
 }
 
 /// My name and colour for drawing together, and whether friends ask to join
@@ -4916,17 +4908,6 @@ mod tests {
 
     fn typed(a: &PaintApp) -> &str {
         a.text.as_ref().map_or("", |t| t.text.as_str())
-    }
-
-    #[test]
-    fn zoom_keys_zoom_the_picture_not_the_buttons() {
-        let mut a = app();
-        type_events(&mut a, vec![key(Key::Plus, Modifiers::COMMAND)]);
-        type_events(&mut a, vec![key(Key::Plus, Modifiers::COMMAND)]);
-        assert!(a.zoom > 1.0);
-        assert_eq!(a.ctx.zoom_factor(), 1.0, "the ribbon and status bar stay their size");
-        type_events(&mut a, vec![key(Key::Minus, Modifiers::COMMAND)]);
-        assert_eq!(a.ctx.zoom_factor(), 1.0);
     }
 
     #[test]
@@ -5385,21 +5366,10 @@ mod tests {
             let mut over = RgbaImage::new(4, 2);
             over.put_pixel(2, 1, Rgba(RED));
             let shown = with_friends(&img, Some(&over), IRect::new(1, 0, 4, 2));
-            assert_eq!(shown.size, [3, 2]);
-            let px = |x: usize, y: usize| shown.pixels[y * 3 + x].to_array();
+            let px = |x: usize, y: usize| &shown[(y * 3 + x) * 4..(y * 3 + x) * 4 + 4];
             assert_eq!(px(1, 1), RED, "the friend's pixel replaces mine");
             assert_eq!(px(0, 1), WHITE, "elsewhere the picture shows through");
             assert_eq!(px(2, 0), WHITE);
-        }
-
-        #[test]
-        fn the_picture_on_screen_is_the_picture_with_its_transparency() {
-            let img = RgbaImage::from_fn(5, 3, |x, y| Rgba([x as u8 * 50, y as u8 * 90, 7, (x * 60 + y * 5) as u8]));
-            let r = IRect::new(1, 1, 5, 3);
-            let src = &img;
-            let crop: Vec<u8> = (1..3).flat_map(|y| (1..5).flat_map(move |x| src.get_pixel(x, y).0)).collect();
-            let shown = with_friends(&img, None, r);
-            assert_eq!(shown.pixels, ColorImage::from_rgba_unmultiplied([4, 2], &crop).pixels);
         }
 
         #[test]
@@ -5475,8 +5445,6 @@ mod tests {
         #[test]
         fn when_the_host_asks_first_friends_wait_until_let_in() {
             let mut room = Room::new(2);
-            // Saved, but in the tests' own settings, never those of whoever runs them.
-            assert!(settings_dir().is_some_and(|d| d.starts_with(std::env::temp_dir())));
             room.kid(0).set_ask_first(true);
             line(room.kid(0), Tool::Pencil, RED, (10.0, 10.0), (60.0, 10.0));
             room.quiesce();
