@@ -1,0 +1,50 @@
+/*
+ * Paint (C port) - undo and redo (Rust: history.rs)
+ *
+ * Most edits store only the before/after pixels of the rectangle they
+ * touched; edits that change the canvas size store whole pictures. The
+ * oldest steps are dropped beyond a 1 GB budget. Each step has an id, so
+ * drawing together can tell which steps are still "mine".
+ */
+#ifndef PAINT_HISTORY_H
+#define PAINT_HISTORY_H
+
+#include <stdint.h>
+#include "core/img.h"
+
+enum
+{
+    CHANGE_PATCH,       /* x y: before and after are the same size, placed at x y */
+    CHANGE_REPLACE,     /* before and after are whole pictures (sizes may differ) */
+};
+
+typedef struct
+{
+    int kind;
+    int x, y;
+    img *before, *after;    /* owned */
+} change;
+
+/* The difference between two same-sized pictures within r, or NULL if nothing changed */
+change *change_patch(const img *before, const img *after, irect r);
+change *change_replace(img *before, img *after);   /* takes ownership of both */
+void change_free(change *c);
+void change_apply(const change *c, img **picture, int undo);  /* may replace *picture (CHANGE_REPLACE) */
+
+typedef struct history history;
+
+history *history_new(void);
+void history_free(history *h);
+void history_push(history *h, change *c);          /* takes ownership; clears redo */
+int history_undo(history *h, img **picture);        /* 1 if a step was undone */
+int history_redo(history *h, img **picture);
+/* Step back (undo) or forward without applying: `apply` decides and returns 1 if it
+ * did it (the step then moves to the other stack), 0 to leave the stacks alone */
+int history_step_with(history *h, int back, int (*apply)(const change *c, void *user), void *user);
+uint64_t history_redo_id(const history *h);         /* id of the step a redo would bring back, 0 none */
+int history_can_undo(const history *h);
+int history_can_redo(const history *h);
+uint64_t history_state_id(const history *h);        /* id of the newest applied step (0 = none): "is it saved?" */
+void history_clear(history *h);
+
+#endif
