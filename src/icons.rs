@@ -3,7 +3,7 @@
 
 use std::f32::consts::{PI, TAU};
 
-use eframe::egui::{
+use egui::{
     Color32, ColorImage, Context, FontId, Id, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2,
     ecolor::Hsva, pos2, vec2,
 };
@@ -230,7 +230,7 @@ impl Pen<'_> {
         let w = self.hairline();
         let y = self.snap(self.p((0.0, y)).y - w / 2.0) + w / 2.0;
         let (a, b) = (self.snap(self.p((x0, 0.0)).x), self.snap(self.p((x1, 0.0)).x));
-        self.painter.hline(eframe::egui::Rangef::new(a, b), y, Stroke::new(w, self.c(color)));
+        self.painter.hline(egui::Rangef::new(a, b), y, Stroke::new(w, self.c(color)));
     }
 
     fn disc(&self, c: (f32, f32), r: f32, fill: Color32) {
@@ -633,7 +633,7 @@ fn paint_with(icon: Icon, painter: &Painter, rect: Rect, disabled: bool, solid: 
             pen.text((10.0, 10.5), "A", theme::serif_bold(15.0), BLUE);
         }
         Icon::Bold => pen.text((10.0, 10.0), "B", theme::serif_bold(17.0), INK),
-        Icon::Italic => pen.text((10.0, 10.0), "I", FontId::new(17.0, eframe::egui::FontFamily::Name("serif".into())), INK),
+        Icon::Italic => pen.text((10.0, 10.0), "I", FontId::new(17.0, egui::FontFamily::Name("serif".into())), INK),
         Icon::Underline => {
             pen.text((10.0, 8.5), "U", theme::serif(15.0), INK);
             pen.line(&[(5.0, 17.0), (15.0, 17.0)], INK, 1.2);

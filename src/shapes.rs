@@ -3,7 +3,7 @@
 
 use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, TAU};
 
-use eframe::egui::{Pos2, Rect, pos2, vec2};
+use egui::{Pos2, Rect, pos2, vec2};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShapeKind {

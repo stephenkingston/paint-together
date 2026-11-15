@@ -1,6 +1,6 @@
 [package]
 name = "paint-together"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Classic Windows Paint, rebuilt in Rust, where kids on the same Wi-Fi draw on one picture together in real time"
@@ -21,11 +21,21 @@ path = "src/main.rs"
 ab_glyph = "0.2"
 arboard = "3.6"
 bincode = "2"
-eframe = "0.36"
+egui = "0.36"
+# The window and its input (winit), with copy and paste, links and screen readers
+egui-winit = { version = "0.36", features = ["accesskit"] }
+# Puts the pixels the app draws (on the CPU, src/soft.rs) in the window
+softbuffer = "0.4"
 flate2 = "1"
 mdns-sd = "0.21"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff", "webp", "ico"] }
 rfd = "0.17"
+
+# The Dock icon when Paint isn't run from its app bundle
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSBitmapImageRep", "NSGraphics", "NSImage", "NSImageRep", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry"] }
 
 # Windows names its font files briefly (arialbd.ttf), so the Text tool reads
 # each font's own name table there.

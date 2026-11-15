@@ -2,7 +2,7 @@
 
 use std::f32::consts::FRAC_1_SQRT_2;
 
-use eframe::egui::{Pos2, vec2};
+use egui::{Pos2, vec2};
 
 use crate::raster::{IRect, Mask};
 

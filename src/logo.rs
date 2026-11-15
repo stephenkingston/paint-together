@@ -4,7 +4,7 @@
 
 use std::f32::consts::TAU;
 
-use eframe::egui::{Pos2, Vec2, pos2, vec2};
+use egui::{Pos2, Vec2, pos2, vec2};
 use image::{RgbaImage, imageops};
 
 use crate::raster::{self, IRect, Mask, Rgba8};

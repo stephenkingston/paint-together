@@ -2,7 +2,7 @@
 //! committed it can be moved, resized from its handles and restyled, and is
 //! re-rasterised from scratch each time.
 
-use eframe::egui::{Pos2, Rect, pos2, vec2};
+use egui::{Pos2, Rect, pos2, vec2};
 use image::RgbaImage;
 
 use crate::raster::{self, IRect, Mask, Rgba8};
@@ -190,15 +190,15 @@ impl LiveShape {
         self.b = pos2(x1, y1);
     }
 
-    pub fn translate(&mut self, (a, b): (Pos2, Pos2), d: eframe::egui::Vec2) {
+    pub fn translate(&mut self, (a, b): (Pos2, Pos2), d: egui::Vec2) {
         self.a = a + d;
         self.b = b + d;
     }
 }
 
 /// Mouse cursor for a handle of a box (corners diagonal, edges straight).
-pub fn handle_cursor(is_line: bool, h: usize) -> eframe::egui::CursorIcon {
-    use eframe::egui::CursorIcon;
+pub fn handle_cursor(is_line: bool, h: usize) -> egui::CursorIcon {
+    use egui::CursorIcon;
     if is_line {
         return CursorIcon::Crosshair;
     }

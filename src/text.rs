@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont, point};
-use eframe::egui::{Pos2, pos2};
+use egui::{Pos2, pos2};
 
 use crate::raster::{IRect, Mask};
 
@@ -391,9 +391,9 @@ impl CaretLayout {
     }
 
     /// Top-left of the caret at `index`, relative to the origin.
-    pub fn caret(&self, index: usize) -> eframe::egui::Vec2 {
+    pub fn caret(&self, index: usize) -> egui::Vec2 {
         let (l, c) = self.line_col(index);
-        eframe::egui::vec2(self.lines[l][c], l as f32 * self.line_h)
+        egui::vec2(self.lines[l][c], l as f32 * self.line_h)
     }
 
     /// Nearest caret position on `line` to `x`.
@@ -403,7 +403,7 @@ impl CaretLayout {
     }
 
     /// Nearest caret index to a point relative to the origin.
-    pub fn index_at(&self, p: eframe::egui::Vec2) -> usize {
+    pub fn index_at(&self, p: egui::Vec2) -> usize {
         let line = ((p.y / self.line_h).floor().max(0.0) as usize).min(self.lines.len() - 1);
         self.index(line, self.col_at(line, p.x))
     }

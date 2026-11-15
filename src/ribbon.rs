@@ -1,7 +1,7 @@
 //! Controls of the Windows "Scenic Ribbon" that classic Paint is built from:
 //! large and small buttons, split buttons, groups, tabs, menu rows and swatches.
 
-use eframe::egui::{Align2, Color32, CornerRadius, FontId, Mesh, Painter, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
+use egui::{Align2, Color32, CornerRadius, FontId, Mesh, Painter, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 
 use crate::icons::{self, Icon};
 use crate::theme::CLASSIC as P;
@@ -193,7 +193,7 @@ pub fn group(ui: &mut Ui, caption: Option<&str>, content_h: f32, add: impl FnOnc
         ui.spacing_mut().item_spacing.y = 0.0;
         let row = ui.allocate_ui_with_layout(
             vec2(ui.available_width(), CONTENT_H),
-            eframe::egui::Layout::top_down(eframe::egui::Align::Min),
+            egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 ui.set_min_height(CONTENT_H);
                 ui.set_min_width(caption_w);
@@ -210,7 +210,7 @@ pub fn group(ui: &mut Ui, caption: Option<&str>, content_h: f32, add: impl FnOnc
         }
     });
     let (rect, _) = ui.allocate_exact_size(vec2(9.0, CONTENT_H + 17.0), Sense::hover());
-    ui.painter().vline(rect.center().x, eframe::egui::Rangef::new(rect.top() + 2.0, rect.bottom() - 2.0), Stroke::new(1.0, P.group_separator));
+    ui.painter().vline(rect.center().x, egui::Rangef::new(rect.top() + 2.0, rect.bottom() - 2.0), Stroke::new(1.0, P.group_separator));
 }
 
 /// A tab on the ribbon's tab strip.
@@ -275,7 +275,7 @@ fn selected_tab_outline(painter: &Painter, rect: Rect) {
     pts.extend(arc(pos2(x0 + top_r, y0 + top_r), top_r, 2.0 * FRAC_PI_2, 3.0 * FRAC_PI_2));
     pts.extend(arc(pos2(x1 - top_r, y0 + top_r), top_r, 3.0 * FRAC_PI_2, 4.0 * FRAC_PI_2));
     pts.extend(arc(pos2(x1 + r, base - r), r, 2.0 * FRAC_PI_2, FRAC_PI_2));
-    painter.add(eframe::egui::Shape::line(pts, Stroke::new(1.0, P.ribbon_border)));
+    painter.add(egui::Shape::line(pts, Stroke::new(1.0, P.ribbon_border)));
 }
 
 /// The blue "File" tab.
@@ -331,7 +331,7 @@ pub fn file_menu_item(ui: &mut Ui, icon: Icon, label: &str, arrow: bool, highlig
         painter.text(rect.left_center() + vec2(50.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(13.0), P.text);
         if arrow {
             let c = rect.right_center() - vec2(12.0, 0.0);
-            ui.painter().add(eframe::egui::Shape::convex_polygon(
+            ui.painter().add(egui::Shape::convex_polygon(
                 vec![c + vec2(-3.0, -5.0), c + vec2(3.0, 0.0), c + vec2(-3.0, 5.0)],
                 P.text,
                 Stroke::NONE,
@@ -370,20 +370,20 @@ pub fn status_item(ui: &mut Ui, icon: Icon, text: &str, width: f32) {
     let (rect, _) = ui.allocate_exact_size(vec2(width, 22.0), Sense::hover());
     icons::paint(icon, ui.painter(), icons::square(rect.left_center() + vec2(10.0, 0.0), 16.0), true);
     ui.painter().text(rect.left_center() + vec2(24.0, 0.0), Align2::LEFT_CENTER, text, FontId::proportional(12.0), P.text);
-    ui.painter().vline(rect.max.x - 0.5, eframe::egui::Rangef::new(rect.top() + 2.0, rect.bottom() - 2.0), Stroke::new(1.0, P.status_border));
+    ui.painter().vline(rect.max.x - 0.5, egui::Rangef::new(rect.top() + 2.0, rect.bottom() - 2.0), Stroke::new(1.0, P.status_border));
 }
 
 /// A status bar item that can be clicked, shown like a link.
 pub fn status_link(ui: &mut Ui, icon: Icon, text: &str) -> Response {
     let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(12.0), P.accent);
     let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 34.0, 22.0), Sense::click());
-    let resp = resp.on_hover_cursor(eframe::egui::CursorIcon::PointingHand);
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if resp.hovered() {
         ui.painter().rect_filled(rect.shrink2(vec2(1.0, 2.0)), HIGHLIGHT_RADIUS, P.hover);
     }
     icons::paint(icon, ui.painter(), icons::square(rect.left_center() + vec2(12.0, 0.0), 16.0), true);
     ui.painter().galley(rect.left_center() + vec2(26.0, -galley.size().y / 2.0), galley, P.accent);
-    ui.painter().vline(rect.max.x - 0.5, eframe::egui::Rangef::new(rect.top() + 2.0, rect.bottom() - 2.0), Stroke::new(1.0, P.status_border));
+    ui.painter().vline(rect.max.x - 0.5, egui::Rangef::new(rect.top() + 2.0, rect.bottom() - 2.0), Stroke::new(1.0, P.status_border));
     resp
 }
 
@@ -403,9 +403,9 @@ pub fn zoom_slider(ui: &mut Ui, t: &mut f32, tick: f32, width: f32) -> Response 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let y = rect.center().y;
-        painter.hline(eframe::egui::Rangef::new(x0, x1), y, Stroke::new(1.0, Color32::from_rgb(0x9A, 0x9A, 0x9A)));
+        painter.hline(egui::Rangef::new(x0, x1), y, Stroke::new(1.0, Color32::from_rgb(0x9A, 0x9A, 0x9A)));
         let tx = x0 + (x1 - x0) * tick;
-        painter.vline(tx, eframe::egui::Rangef::new(y - 4.0, y + 4.0), Stroke::new(1.0, Color32::from_rgb(0x9A, 0x9A, 0x9A)));
+        painter.vline(tx, egui::Rangef::new(y - 4.0, y + 4.0), Stroke::new(1.0, Color32::from_rgb(0x9A, 0x9A, 0x9A)));
         let x = x0 + (x1 - x0) * *t;
         let thumb = Rect::from_center_size(pos2(x, y), vec2(6.0, 14.0));
         let fill = if resp.hovered() || resp.dragged() { P.accent } else { Color32::from_rgb(0x60, 0x60, 0x60) };
@@ -454,7 +454,7 @@ pub fn value_slider(ui: &mut Ui, value: &mut f32, min: f32, max: f32, log: bool,
         let y = track.center().y;
         let x = track.min.x + track.width() * to_t(*value).clamp(0.0, 1.0);
         painter.hline(track.x_range(), y, Stroke::new(2.0, Color32::from_rgb(0xC4, 0xC4, 0xC4)));
-        painter.hline(eframe::egui::Rangef::new(track.min.x, x), y, Stroke::new(2.0, P.accent));
+        painter.hline(egui::Rangef::new(track.min.x, x), y, Stroke::new(2.0, P.accent));
         let thumb = Rect::from_center_size(pos2(x, y), vec2(8.0, 18.0));
         let fill = if resp.hovered() || resp.dragged() { Color32::from_rgb(0x17, 0x17, 0x17) } else { P.accent };
         painter.rect_filled(thumb, 4.0, fill);

@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bincode::{Decode, Encode};
-use eframe::egui::Context;
+use egui::Context;
 use image::RgbaImage;
 
 use super::hub::{Hub, To};

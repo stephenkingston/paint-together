@@ -1,4 +1,4 @@
-use eframe::egui::pos2;
+use egui::pos2;
 use image::{Rgba, RgbaImage};
 
 use crate::brush::BrushKind;

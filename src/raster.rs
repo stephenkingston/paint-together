@@ -6,7 +6,7 @@
 //! anti-aliased strokes free of the dark "beads" you get from re-blending
 //! overlapping dabs, and lets shapes be re-rasterized on every mouse move.
 
-use eframe::egui::{Pos2, Vec2, pos2, vec2};
+use egui::{Pos2, Vec2, pos2, vec2};
 use image::{Rgba, RgbaImage, imageops};
 
 pub type Rgba8 = [u8; 4];

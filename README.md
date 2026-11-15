@@ -85,7 +85,7 @@ Each release also has builds for Windows and macOS; its notes say how to open th
 
 ### Requirements
 - **Linux with glibc 2.35 or newer** for the prebuilt binary: Ubuntu 22.04, Debian 12, Fedora 36, Arch, or later.
-- **Wayland or X11**, with working **Vulkan or OpenGL** drivers.
+- **Wayland or X11**. No graphics drivers are needed: Paint draws its window on the processor.
 - **fontconfig**, which the Text tool uses to find fonts.
 - An **XDG desktop portal** (`xdg-desktop-portal` plus a backend such as `-gtk`, `-kde`, `-gnome` or `-hyprland`) for the Open and Save dialogs. Desktop environments include one.
 
@@ -242,6 +242,8 @@ Pushing a version tag (`git tag v0.2.0 && git push origin v0.2.0`) runs [`.githu
 
 Paint is a single egui application. Some details worth knowing:
 
+- **Drawn without the graphics card.** egui lays out the window and turns it into triangles; Paint's own renderer (`src/soft.rs`) fills them into the window's pixels on the processor, matching egui's GPU renderer pixel for pixel, on a few threads. Each frame it works out what looks different from the last one (down to single triangles, and the changed part of the picture) and redraws only that, so moving the mouse or drawing redraws a fraction of a percent of the window. [winit](https://github.com/rust-windowing/winit) opens the window and [softbuffer](https://github.com/rust-windowing/softbuffer) hands the pixels to the OS. No graphics driver is loaded, which keeps memory low and lets Paint run where drivers don't work.
+
 - **Drawing through coverage masks.** Tools don't paint straight onto the picture. Each stroke or shape is drawn as a coverage mask (how much of each pixel it covers, from 0 to 1), keeping the highest value per pixel. The mask is then composited over a snapshot taken when the operation began. This gives smooth, anti-aliased strokes without dark beads where they overlap, and lets shapes be redrawn from scratch on every mouse move.
 - **Shapes and text stay live.** A live shape or text box remembers what was underneath it. Every move, resize or style change restores that area and redraws the object, until it is committed as a single undo step.
 - **Flood fill that respects anti-aliasing.** After the normal fill, a second pass walks outward through the outline's smoothed edge pixels. It measures how much of each pixel is old background and how much is outline color, and redraws it as the same blend of the new color and the outline. It only moves toward the outline, so it can't leak past it.
@@ -263,6 +265,8 @@ Paint is a single egui application. Some details worth knowing:
 | File | What's in it |
 |---|---|
 | `src/main.rs` | Entry point and window setup; `--join ADDRESS`, and `--export-icon PATH [SIZE]` (used for packaging) |
+| `src/shell.rs` | The window: input, closing, repaint timing, accessibility, and showing only what changed |
+| `src/soft.rs` | The renderer: egui's triangles drawn on the processor, and working out what changed between frames |
 | `src/app.rs` | The app: state, tools, mouse and keyboard handling, ribbon tabs, menus, dialogs, canvas view |
 | `src/ribbon.rs` | Ribbon controls: big, small and split buttons, groups, tabs, menu rows, swatches, sliders |
 | `src/icons.rs` | Vector icons and their pixel-snapping drawing helpers |
@@ -295,7 +299,8 @@ Paint is a single egui application. Some details worth knowing:
 cargo test
 ```
 
-The suite of 65 tests covers:
+The suite of 72 tests covers:
+- **The renderer:** shapes cover exactly their pixels, triangles sharing an edge don't blend it twice, every thread count draws the same pixels, and redrawing only what changed gives the same pixels as redrawing everything (in synthetic scenes and in the real window while hovering, drawing, zooming and undoing).
 - **Pixel engine:** polygon coverage, anti-aliased capsules, flood fill boundaries, tolerance, and fills that reach anti-aliased edges without leaking.
 - **Undo history.**
 - **Shapes and brushes:** the geometry of every shape, and every brush.
@@ -338,4 +343,4 @@ One more test is run by hand across two computers: start a drawing on one, then 
 
 Released under the [MIT License](LICENSE). © 2026 Stephen Kingston.
 
-Built with [egui/eframe](https://github.com/emilk/egui), [image](https://github.com/image-rs/image), [ab_glyph](https://github.com/alexheretic/ab-glyph), [rfd](https://github.com/PolyMeilleur/rfd), [arboard](https://github.com/1Password/arboard), [mdns-sd](https://github.com/keepsimple1/mdns-sd), [bincode](https://github.com/bincode-org/bincode) and [flate2](https://github.com/rust-lang/flate2-rs).
+Built with [egui](https://github.com/emilk/egui), [winit](https://github.com/rust-windowing/winit), [softbuffer](https://github.com/rust-windowing/softbuffer), [image](https://github.com/image-rs/image), [ab_glyph](https://github.com/alexheretic/ab-glyph), [rfd](https://github.com/PolyMeilleur/rfd), [arboard](https://github.com/1Password/arboard), [mdns-sd](https://github.com/keepsimple1/mdns-sd), [bincode](https://github.com/bincode-org/bincode) and [flate2](https://github.com/rust-lang/flate2-rs).

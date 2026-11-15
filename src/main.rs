@@ -13,15 +13,16 @@ mod logo;
 mod raster;
 mod ribbon;
 mod shapes;
+mod shell;
+mod soft;
 #[cfg(test)]
 mod tests;
 mod text;
 mod text_edit;
 mod theme;
 
-use eframe::egui;
 
-fn main() -> eframe::Result {
+fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
     // `--export-icon PATH [SIZE]`: used by the packaging scripts.
@@ -41,8 +42,7 @@ fn main() -> eframe::Result {
         (first.map(std::path::PathBuf::from), None)
     };
     let icon = logo::render(256);
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    let viewport = egui::ViewportBuilder::default()
             .with_title("Untitled - Paint")
             .with_app_id("paint")
             .with_inner_size([1460.0, 900.0])
@@ -52,8 +52,6 @@ fn main() -> eframe::Result {
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
             .with_title_shown(false)
-            .with_icon(egui::IconData { width: icon.width(), height: icon.height(), rgba: icon.into_raw() }),
-        ..Default::default()
-    };
-    eframe::run_native("Paint", options, Box::new(move |cc| Ok(Box::new(app::PaintApp::new(cc, initial, join)))))
+            .with_icon(egui::IconData { width: icon.width(), height: icon.height(), rgba: icon.into_raw() });
+    shell::run(viewport, move |ctx| app::PaintApp::new(ctx, initial, join))
 }

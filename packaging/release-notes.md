@@ -4,10 +4,10 @@ Also on crates.io: `cargo install paint-together` installs the `paint` command.
 
 ### New in this release
 
-- **Back to 0.3.0.** This is the same Paint as 0.3.0: everything 0.3.1 and 0.3.2 changed is undone. On Windows, Paint no longer draws with Direct3D 12 or keeps a crash report, and undo history is back to a 1 GB budget.
-- Draws together with 0.3.0, 0.3.1 and 0.3.2.
-
-For what 0.3.0 brought (approving who joins, kicking out, and shapes stamping when you pick another), see the [0.3.0 release notes](https://github.com/stephenkingston/paint-together/releases/tag/v0.3.0).
+- **Drawn without the graphics card.** Paint now draws its window on the processor instead of through the graphics driver. It uses about a third of the memory on Linux (46 MB instead of 142 MB in an idle window) and Windows (54 MB instead of 94 MB), and less on macOS (57 MB instead of 70 MB). The download is smaller too.
+- **Runs where graphics drivers don't.** Paint no longer needs Vulkan, OpenGL or Direct3D, so it works in virtual machines and on computers whose graphics drivers are missing or broken.
+- **Only what changes is redrawn.** Moving the mouse or drawing redraws a tiny part of the window, so Paint stays light on the processor too.
+- Draws together with 0.3.x.
 
 ### Linux (x86_64)
 
@@ -18,7 +18,7 @@ cd paint-*-linux-x86_64
 ./install.sh            # install for your user: ~/.local/bin/paint plus an app-launcher entry
 ```
 
-Requirements: an x86_64 distribution with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, Arch and later), X11 or Wayland, Vulkan or OpenGL graphics drivers, fontconfig (for the Text tool's fonts) and an XDG desktop portal (for the Open/Save dialogs; standard on desktop setups).
+Requirements: an x86_64 distribution with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, Arch and later), X11 or Wayland, fontconfig (for the Text tool's fonts) and an XDG desktop portal (for the Open/Save dialogs; standard on desktop setups).
 
 Check the download with `sha256sum -c paint-*-linux-x86_64.tar.gz.sha256`.
 

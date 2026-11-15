@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use eframe::egui::scroll_area::{DragScroll, ScrollSource};
-use eframe::egui::{
+use egui::scroll_area::{DragScroll, ScrollSource};
+use egui::{
     self, Align, Align2, Color32, ColorImage, Context, CursorIcon, Event, FontId, Id, Key, KeyboardShortcut, Layout,
     Modifiers, PointerButton, PopupCloseBehavior, Pos2, Rect, Response, RichText, ScrollArea, Sense, Shape, Stroke,
     StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, ViewportCommand, pos2, vec2,
@@ -379,8 +379,8 @@ pub struct PaintApp {
 }
 
 impl PaintApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>, join: Option<String>) -> Self {
-        let mut app = Self::with_context(cc.egui_ctx.clone(), initial);
+    pub fn new(ctx: &Context, initial: Option<PathBuf>, join: Option<String>) -> Self {
+        let mut app = Self::with_context(ctx.clone(), initial);
         app.lan_discovery = true;
         match load_me() {
             Some((name, color, ask_first)) => (app.me_name, app.me_color, app.ask_first) = (name, color, ask_first),
@@ -3992,8 +3992,9 @@ impl PaintApp {
     }
 }
 
-impl eframe::App for PaintApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+impl PaintApp {
+    /// One frame of the whole window.
+    pub fn ui(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         if !self.focused_once {
             // Launched from a terminal, macOS would otherwise leave the window in the background.
@@ -5779,4 +5780,127 @@ fn more_button(ui: &mut Ui, count: &str, pal: &Palette) -> Response {
     painter.text(rect.center_top() + vec2(0.0, 16.0), Align2::CENTER_CENTER, count, FontId::proportional(11.0), pal.text);
     icons::paint(Icon::GalleryMore, painter, icons::square(rect.center_bottom() - vec2(0.0, 14.0), 12.0), true);
     resp
+}
+
+#[cfg(test)]
+mod render_timing {
+    //! How long the CPU takes to draw the whole window, at 1× and 2× (Retina) scale,
+    //! hovering over the picture and drawing on it:
+    //! `cargo test --release render_timing -- --ignored --nocapture`
+
+    use super::*;
+    use crate::soft;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    #[ignore]
+    fn render_timing() {
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1460.0, 900.0));
+        for ppp in [1.0f32, 2.0] {
+            let ctx = Context::default();
+            let mut a = PaintApp::with_context(ctx.clone(), None);
+            let (w, h) = ((screen.width() * ppp) as usize, (screen.height() * ppp) as usize);
+            let mut renderer = soft::Renderer::default();
+            let mut px = vec![0u32; w * h];
+            let mut frame = |a: &mut PaintApp, events: Vec<Event>, threads: usize| -> (Duration, Duration, f64) {
+                let mut input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+                input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+                let t0 = Instant::now();
+                let out = ctx.run_ui(input, |ui| a.ui(ui));
+                let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+                renderer.set_textures(&out.textures_delta);
+                let areas = renderer.damage(&prims, &out.textures_delta, [w, h], out.pixels_per_point);
+                let t1 = Instant::now();
+                renderer.render(&mut px, [w, h], out.pixels_per_point, 0, &prims, &areas, threads);
+                let t2 = Instant::now();
+                renderer.free_textures(&out.textures_delta);
+                (t1 - t0, t2 - t1, areas.iter().map(soft::Rect::area).sum::<i64>() as f64 / (w * h) as f64)
+            };
+            for _ in 0..5 {
+                frame(&mut a, vec![], 8);
+            }
+            let c = a.canvas_rect;
+            let at = |i: usize| c.min + vec2(40.0 + (i * 13 % 600) as f32, 40.0 + (i * 7 % 400) as f32);
+            for threads in [1, 4, 8] {
+                let report = |what: &str, times: Vec<(Duration, Duration, f64)>| {
+                    let n = times.len() as f64;
+                    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+                    let ui = times.iter().map(|t| ms(t.0)).sum::<f64>() / n;
+                    let draw = times.iter().map(|t| ms(t.1)).sum::<f64>() / n;
+                    let worst = times.iter().map(|t| ms(t.1)).fold(0.0, f64::max);
+                    let share = times.iter().map(|t| t.2).sum::<f64>() / n * 100.0;
+                    eprintln!("{w}×{h} px, {threads} threads, {what:8}: egui {ui:5.2} ms, CPU drawing {draw:5.2} ms (worst {worst:5.2}), redrawing {share:4.1}% of the window");
+                };
+                let hover: Vec<_> = (0..40).map(|i| frame(&mut a, vec![Event::PointerMoved(at(i))], threads)).collect();
+                report("hovering", hover);
+                let press = |p, pressed| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+                frame(&mut a, vec![press(at(0), true)], threads);
+                let draw: Vec<_> = (1..41).map(|i| frame(&mut a, vec![Event::PointerMoved(at(i))], threads)).collect();
+                frame(&mut a, vec![press(at(41), false)], threads);
+                report("drawing", draw);
+            }
+        }
+    }
+
+    /// Redrawing only what egui's output says changed must give the very pixels a full
+    /// redraw gives, frame after frame, through hovering, drawing, zooming and undoing.
+    #[test]
+    fn redrawing_what_changed_matches_redrawing_everything() {
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 640.0));
+        for ppp in [1.0f32, 1.5] {
+            let ctx = Context::default();
+            let mut a = PaintApp::with_context(ctx.clone(), None);
+            let size = [(screen.width() * ppp) as usize, (screen.height() * ppp) as usize];
+            let mut renderer = soft::Renderer::default();
+            let (mut kept, mut whole) = (vec![0u32; size[0] * size[1]], vec![0u32; size[0] * size[1]]);
+            let mut redrawn = 0.0;
+            let mut frame = |a: &mut PaintApp, events: Vec<Event>, n: usize| {
+                let mut input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+                input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+                let out = ctx.run_ui(input, |ui| a.ui(ui));
+                let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+                renderer.set_textures(&out.textures_delta);
+                let mut areas = renderer.damage(&prims, &out.textures_delta, size, out.pixels_per_point);
+                if n == 0 {
+                    areas = vec![soft::Rect::of_size(size)];
+                }
+                redrawn += areas.iter().map(soft::Rect::area).sum::<i64>() as f64 / (size[0] * size[1]) as f64;
+                renderer.render(&mut kept, size, out.pixels_per_point, 0, &prims, &areas, 4);
+                renderer.render(&mut whole, size, out.pixels_per_point, 0, &prims, &[soft::Rect::of_size(size)], 4);
+                if let Some(i) = (0..kept.len()).find(|&i| kept[i] != whole[i]) {
+                    panic!("frame {n} at {ppp}×: pixel {},{} is {:06x}, should be {:06x}; redrew {areas:?}", i % size[0], i / size[0], kept[i], whole[i]);
+                }
+                renderer.free_textures(&out.textures_delta);
+            };
+            let mut n = 0;
+            let mut step = |a: &mut PaintApp, events: Vec<Event>| {
+                frame(a, events, n);
+                n += 1;
+            };
+            for _ in 0..4 {
+                step(&mut a, vec![]);
+            }
+            let c = a.canvas_rect;
+            let at = |i: usize| c.min + vec2(30.0 + (i * 17 % 400) as f32, 30.0 + (i * 11 % 250) as f32);
+            let press = |p, pressed| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+            for i in 0..6 {
+                step(&mut a, vec![Event::PointerMoved(at(i))]);
+            }
+            step(&mut a, vec![press(at(6), true)]);
+            for i in 7..16 {
+                step(&mut a, vec![Event::PointerMoved(at(i))]);
+            }
+            step(&mut a, vec![press(at(16), false)]);
+            for x in (20..900).step_by(110) {
+                step(&mut a, vec![Event::PointerMoved(pos2(x as f32, 90.0))]);
+            }
+            let key = |key| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND };
+            for k in [Key::Plus, Key::Z, Key::Minus] {
+                step(&mut a, vec![key(k)]);
+                step(&mut a, vec![]);
+            }
+            step(&mut a, vec![Event::PointerMoved(at(3))]);
+            eprintln!("{ppp}×: redrew {:.0}% of the window per frame on average", redrawn * 100.0 / n as f64);
+        }
+    }
 }
