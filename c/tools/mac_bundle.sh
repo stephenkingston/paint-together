@@ -80,6 +80,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# An ad-hoc signature over the whole bundle (Info.plist included), which arm64 needs to run
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+# An ad-hoc signature over the whole bundle (Info.plist included), which arm64 needs to run. An ad-hoc
+# signature has no certificate to hold, so little room is kept for one (codesign keeps 16 KB by default)
+codesign --force --sign - --signature-size 256 "$APP" >/dev/null 2>&1 || codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 echo "built $APP ($SHORT)"

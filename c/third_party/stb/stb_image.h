@@ -4308,7 +4308,13 @@ static const int stbi__zdist_extra[32] =
 
 static int stbi__parse_huffman_block(stbi__zbuf *a)
 {
-   char *zout = a->zout;
+   char *zout;
+#ifdef STBI_ZFAST_BLOCK
+   // Paint: a faster decoder takes the block as far as it can (1: to its end, 0: error); this finishes it
+   int fast = STBI_ZFAST_BLOCK(a);
+   if (fast != 2) return fast;
+#endif
+   zout = a->zout;
    for(;;) {
       int z = stbi__zhuffman_decode(a, &a->z_length);
       if (z < 256) {
@@ -4752,6 +4758,9 @@ static int stbi__create_png_image_raw(stbi__png *a, stbi_uc *raw, stbi__uint32 r
       if (j == 0) filter = first_row_filter[filter];
 
       // perform actual filtering
+#ifdef STBI_PNG_UNFILTER
+      STBI_PNG_UNFILTER(cur, raw, prior, filter_bytes, nk, filter); // Paint: a faster one
+#else
       switch (filter) {
       case STBI__F_none:
          memcpy(cur, raw, nk);
@@ -4783,6 +4792,7 @@ static int stbi__create_png_image_raw(stbi__png *a, stbi_uc *raw, stbi__uint32 r
             cur[k] = STBI__BYTECAST(raw[k] + (cur[k-filter_bytes] >> 1));
          break;
       }
+#endif
 
       raw += nk;
 

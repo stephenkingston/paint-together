@@ -9,6 +9,7 @@
 #   make TARGET=mac bundle              build/mac/Paint.app (tools/mac_bundle.sh)
 #   make clean
 #   make DEBUG=1                        unstripped, with symbols (build/<target>-debug)
+#   make NOASM=1                        the kernels' C instead of their assembly (src/core/kernels.h)
 #
 # Size and memory are goals: the binary is built for size (-Oz), except the
 # pixel loops (HOT below, -O2); unused functions and data are dropped at link
@@ -17,7 +18,7 @@
 # Every .c under src/ is built, except that a file named *_<plat>.c is built
 # only where <plat> is one of the target's PLATS (posix, linux, win). The
 # app links the platform's host; the tests link src/host/headless.c instead
-# and draw into memory.
+# and draw into memory. src/core/kernels_<cpu>.S is built for its CPU (ARCH).
 
 TARGET ?= linux
 comma := ,
@@ -34,6 +35,7 @@ ifeq ($(TARGET),linux)
   SYS_LIBS := -lpthread -lm
   EXE      := paint
   RUN      :=
+  ARCH     := $(firstword $(subst -, ,$(shell $(CC) -dumpmachine)))
 else ifeq ($(TARGET),win64)
   # Windows 7 and later. Both Windows builds use the system's msvcrt.dll, not the UCRT
   # (which XP doesn't have, and Windows 7 only with an update), and its printf (mingw's
@@ -48,6 +50,7 @@ else ifeq ($(TARGET),win64)
   SYS_LIBS := -lws2_32 -liphlpapi -lgdi32 -luser32 -lshell32 -lcomdlg32 -lole32 -luuid -ladvapi32 -limm32 -lm
   EXE      := paint.exe
   RUN      := WINEDEBUG=-all wine
+  ARCH     := x86_64
 else ifeq ($(TARGET),win32)
   # Windows XP SP3 and later, on any i686 CPU (no SSE)
   CROSS    ?= i686-w64-mingw32-
@@ -60,6 +63,7 @@ else ifeq ($(TARGET),win32)
   SYS_LIBS := -lws2_32 -liphlpapi -lgdi32 -luser32 -lshell32 -lcomdlg32 -lole32 -luuid -ladvapi32 -limm32 -lm
   EXE      := paint.exe
   RUN      := WINEDEBUG=-all wine
+  ARCH     := i686
 else ifeq ($(TARGET),mac)
   # macOS 10.13 and later. The Cocoa host is C calling the Objective-C runtime.
   CC       := clang
@@ -70,33 +74,41 @@ else ifeq ($(TARGET),mac)
   SYS_LIBS := -framework Cocoa -framework CoreGraphics -framework Carbon -framework IOSurface -lobjc -lpthread -lm
   EXE      := paint
   RUN      :=
+  ARCH     := $(MAC_ARCH)
 else
   $(error unknown TARGET '$(TARGET)': linux, win64, win32, mac)
 endif
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-BUILD   ?= build/$(TARGET)$(if $(DEBUG),-debug)
+BUILD   ?= build/$(TARGET)$(if $(DEBUG),-debug)$(if $(NOASM),-noasm)
 ALL_PLATS := posix linux win mac
 OTHER   := $(filter-out $(PLATS),$(ALL_PLATS))
 FOUND   := $(shell find src -name '*.c')
 SRCS    := $(filter-out $(foreach p,$(OTHER),%_$(p).c),$(FOUND))
 APP_SRCS := $(filter-out src/host/headless.c,$(SRCS))
-OBJS    := $(patsubst %,$(BUILD)/%.o,$(APP_SRCS))
+ASM     := $(if $(NOASM),,$(wildcard src/core/kernels_$(ARCH).S))
+OBJS    := $(patsubst %,$(BUILD)/%.o,$(APP_SRCS) $(ASM))
 # Tests: everything but main.c and the real hosts
-TEST_OBJS := $(patsubst %,$(BUILD)/%.o,$(filter-out src/main.c $(filter-out src/host/headless.c,$(filter src/host/%,$(SRCS))),$(SRCS)))
+TEST_OBJS := $(patsubst %,$(BUILD)/%.o,$(filter-out src/main.c $(filter-out src/host/headless.c,$(filter src/host/%,$(SRCS))),$(SRCS)) $(ASM))
 
 # Files whose loops run per pixel, every frame, every mouse move or every undo step, built
 # -O2: each is here because `make bench` showed -Oz making a frame, a stroke, the undo step,
-# text dragged on the picture, or opening or saving a big picture 15% slower or more
-HOT     := src/ui/gfx.c src/paint/raster.c src/paint/brush.c src/paint/text.c src/paint/history.c src/core/stb_impl.c \
-           src/collab/patch.c
+# text dragged on the picture, or opening or saving a big picture 15% slower or more. (With
+# the kernels in assembly, stb's reading code that's left is fast enough at -Oz. stb_truetype is
+# 20-40% slower at -Oz built by gcc, 6% by Apple's clang, where -O2 costs a 16 KB page of the file.)
+HOT     := src/ui/gfx.c src/paint/raster.c src/paint/brush.c src/paint/text.c src/paint/history.c src/collab/patch.c \
+           src/core/stb_write.c $(if $(filter mac,$(PLATS)),,src/core/stb_font.c) \
+           $(if $(ASM),,src/core/stb_impl.c src/core/kernels.c)
 OPT     ?= -Oz
 # (No -fdata-sections on Windows: mingw's gcc then puts zeroed data in .data$name, 90 KB of zeros in the .exe)
 SIZE_CF := -ffunction-sections $(if $(filter win,$(PLATS)),,-fdata-sections) -fno-asynchronous-unwind-tables -fno-unwind-tables \
            -fno-stack-protector -fno-ident -fmerge-all-constants $(if $(filter linux,$(PLATS)),-fno-plt)
 ifeq ($(TARGET),mac)
-# (-no_data_const: no separate read-only-after-start segment, a 16 KB page of the file; as -z norelro on Linux)
-SIZE_LD := -Wl,-dead_strip -Wl,-no_data_const $(if $(DEBUG),,-Wl$(comma)-x -Wl$(comma)-no_function_starts)
+# (-no_data_const: no separate read-only-after-start segment, a 16 KB page of the file; as -z norelro on Linux.
+# -exported_symbol: export nothing but the header; else the linker lists every function for export, and
+# strip empties that list but leaves its 11 KB in the file)
+SIZE_LD := -Wl,-dead_strip -Wl,-no_data_const -Wl,-exported_symbol,__mh_execute_header \
+           $(if $(DEBUG),,-Wl$(comma)-x -Wl$(comma)-no_function_starts)
 else
 SIZE_LD := -Wl,--gc-sections -Wl,-O1 -Wl,--as-needed $(if $(DEBUG),,-s) $(if $(filter linux,$(PLATS)),-Wl$(comma)--build-id=none -Wl$(comma)-z$(comma)norelro -Wl$(comma)--hash-style=gnu)
 endif
@@ -106,7 +118,8 @@ endif
 LTO     ?= $(if $(or $(DEBUG),$(filter mac,$(PLATS))),,1)
 LTO_LD  := $(if $(LTO),-flto=auto $(OPT))
 CFLAGS  := -std=c11 $(OPT) $(if $(DEBUG),-g) -pipe -MMD -MP $(WARN) $(SIZE_CF) $(CFLAGS_T) -Isrc -Ithird_party/stb \
-           $(if $(LTO),-flto) -DPAINT_VERSION='"$(VERSION)"' $(EXTRA_CFLAGS)
+           $(if $(LTO),-flto) $(if $(ASM),-DPAINT_ASM) -DPAINT_VERSION='"$(VERSION)"' $(EXTRA_CFLAGS)
+ASFLAGS := $(if $(DEBUG),-g) -pipe -MMD -MP $(CFLAGS_T) -Isrc
 LDFLAGS := $(LDFLAGS_T) $(SIZE_LD) $(LTO_LD) $(EXTRA_LDFLAGS)
 RES     := $(if $(filter win,$(PLATS)),$(wildcard res/paint.rc))
 RES_O   := $(if $(RES),$(BUILD)/res.o)
@@ -123,6 +136,10 @@ $(BUILD)/%.c.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(if $(filter $<,$(HOT)),-O2) -c $< -o $@
 
+$(BUILD)/%.S.o: %.S
+	@mkdir -p $(dir $@)
+	$(CC) $(ASFLAGS) -c $< -o $@
+
 $(BUILD)/res.o: $(RES) $(BUILD)/paint.ico $(wildcard res/*.manifest)
 	@mkdir -p $(dir $@)
 	$(WINDRES) -I $(BUILD) -I res $< $@
@@ -131,7 +148,7 @@ $(BUILD)/res.o: $(RES) $(BUILD)/paint.ico $(wildcard res/*.manifest)
 # the build machine, since the cross-compiled paint.exe can't run here. The
 # 64-bit build (Windows 7 and later) holds it as PNGs; XP reads only bitmaps.
 HOST_CC ?= cc
-MKICO_SRCS := tools/mkico.c src/paint/logo.c src/paint/raster.c src/paint/transform.c src/core/img.c src/core/stb_impl.c src/os/os_posix.c
+MKICO_SRCS := tools/mkico.c src/paint/logo.c src/paint/raster.c src/paint/transform.c src/core/img.c src/core/stb_impl.c src/core/stb_write.c src/core/stb_font.c src/core/kernels.c src/os/os_posix.c
 $(BUILD)/paint.ico: $(MKICO_SRCS)
 	@mkdir -p $(BUILD)
 	$(HOST_CC) -std=c11 -O2 -D_GNU_SOURCE -D_DARWIN_C_SOURCE -Isrc -Ithird_party/stb -o $(BUILD)/mkico $(MKICO_SRCS) -lpthread -lm

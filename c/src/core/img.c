@@ -12,12 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "core/img.h"
+#include "core/kernels.h"
 #include "os/os.h"
 #include "stb_image.h"
 #include "stb_image_write.h"
-
-/* Defined in stb_image_write's implementation (stb_impl.c) but not declared by its header */
-unsigned char *stbi_zlib_compress(unsigned char *data, int data_len, int *out_len, int quality);
 
 /* ---- rectangles ---- */
 
@@ -1100,6 +1098,115 @@ static int write_tiff(const img *im, buf *out)
     return out->bad ? -1 : 0;
 }
 
+/* ---- zlib and PNG writing: the bytes stb_image_write makes, by the kernels in kernels.h ---- */
+
+static void be32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 24), p[1] = (uint8_t)(v >> 16), p[2] = (uint8_t)(v >> 8), p[3] = (uint8_t)v;
+}
+
+/* A zlib stream of data as stbi_zlib_compress codes it at quality 8 (Paint's only one), `head` bytes
+ * into the buffer, with `tail` bytes of room after it; *n is its length (adler: with the checksum) */
+static uint8_t *zlib_compress(const uint8_t *data, size_t len, size_t head, size_t tail, int adler, size_t *n)
+{
+    if (len > 0x7FFFFFF0)
+        return NULL;
+    k_deflate_t s = { .data = data, .len = (int32_t)len, .bits = 3, .nbits = 3, .cap = 16 };    /* final block, fixed codes */
+    size_t room = head + len / 4 + 64 + tail;
+    uint8_t *z = malloc(room), *ok = NULL;
+    s.chains = malloc(sizeof *s.chains * K_ZHASH * s.cap);
+    s.counts = calloc(K_ZHASH, sizeof *s.counts);
+    if (!z || !s.chains || !s.counts)
+        goto done;
+    z[head] = 0x78, z[head + 1] = 0x5e;
+    s.out = z + head + 2;
+    for (;;)
+    {
+        s.end = z + room - tail - 4;
+        if (k_deflate(&s))
+            break;
+        size_t at = (size_t)(s.out - z);
+        uint8_t *p = realloc(z, room *= 2);
+        if (!p)
+            goto done;
+        z = p, s.out = z + at;
+    }
+    for (; (int32_t)s.nbits > 0; s.nbits -= 8, s.bits >>= 8)
+        *s.out++ = (uint8_t)s.bits;
+    size_t zlen = (size_t)(s.out - z) - head, blocks = (len + 32766) / 32767;
+    /* stored blocks instead, if those are smaller */
+    if (zlen > len + 2 + blocks * 5)
+    {
+        size_t need = head + 2 + blocks * 5 + len + 4 + tail;
+        if (need > room)
+        {
+            uint8_t *p = realloc(z, room = need);
+            if (!p)
+                goto done;
+            z = p;
+        }
+        uint8_t *o = z + head + 2;
+        for (size_t j = 0; j < len;)
+        {
+            size_t b = len - j < 32767 ? len - j : 32767;
+            *o++ = len - j == b, *o++ = (uint8_t)b, *o++ = (uint8_t)(b >> 8), *o++ = (uint8_t)~b, *o++ = (uint8_t)(~b >> 8);
+            memcpy(o, data + j, b);
+            o += b, j += b;
+        }
+        zlen = (size_t)(o - z) - head;
+    }
+    if (adler)
+        be32(z + head + zlen, k_adler32(1, data, len)), zlen += 4;
+    *n = zlen;
+    ok = z, z = NULL;
+done:
+    free(z);
+    free(s.chains);
+    free(s.counts);
+    return ok;
+}
+
+/* A PNG of the picture, as stbi_write_png_to_mem makes it: each row filtered by the filter whose bytes
+ * add up (as signed) the least, all in one IDAT */
+static uint8_t *png_encode(const img *im, size_t *len)
+{
+    size_t row = (size_t)im->w * 4, n = 0;
+    uint8_t *filt = malloc((row + 1) * (size_t)im->h), *zero = calloc(row, 1), *png = NULL;
+    if (filt && zero)
+    {
+        for (int y = 0; y < im->h; y++)
+        {
+            const uint8_t *cur = im->px + row * (size_t)y, *prev = y ? cur - row : zero;
+            uint8_t *o = filt + (row + 1) * (size_t)y;
+            uint32_t cost[5];
+            int best = 0;
+            k_png_costs(cur, prev, row, cost);
+            for (int f = 1; f < 5; f++)
+                if (cost[f] < cost[best])
+                    best = f;
+            *o = (uint8_t)best;
+            k_png_filter(o + 1, cur, prev, row, best);
+        }
+        png = zlib_compress(filt, (row + 1) * (size_t)im->h, 41, 16, 1, &n);
+    }
+    free(filt);
+    free(zero);
+    if (!png)
+        return NULL;
+    static const uint8_t head[29] = { 137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 'I', 'H', 'D', 'R', [24] = 8, 6 };
+    memcpy(png, head, sizeof head);
+    be32(png + 16, (uint32_t)im->w);
+    be32(png + 20, (uint32_t)im->h);
+    be32(png + 29, k_crc32(0, png + 12, 17));
+    be32(png + 33, (uint32_t)n);
+    memcpy(png + 37, "IDAT", 4);
+    uint8_t *t = png + 41 + n;
+    be32(t, k_crc32(0, png + 37, n + 4));
+    memcpy(t + 4, "\0\0\0\0IEND\xae\x42\x60\x82", 12);
+    *len = 41 + n + 16;
+    return png;
+}
+
 /* ---- writing ---- */
 
 static int ext_is(const char *path, const char *ext)
@@ -1168,7 +1275,8 @@ int img_save(const img *im, const char *path, const char **err)
     }
     else
     {
-        ok = stbi_write_png_to_func(stb_put, &out, im->w, im->h, 4, im->px, im->w * 4) && !out.bad ? 0 : -1;
+        out.p = png_encode(im, &out.n);
+        ok = out.p ? 0 : -1;
         if (ok < 0)
             *err = "The picture couldn't be encoded.";
     }
@@ -1183,14 +1291,7 @@ int img_save(const img *im, const char *path, const char **err)
 
 uint8_t *img_png(const img *im, size_t *len)
 {
-    buf out = { 0 };
-    if (!stbi_write_png_to_func(stb_put, &out, im->w, im->h, 4, im->px, im->w * 4) || out.bad)
-    {
-        free(out.p);
-        return NULL;
-    }
-    *len = out.n;
-    return out.p;
+    return png_encode(im, len);
 }
 
 /* ---- raw deflate ---- */
@@ -1207,16 +1308,11 @@ uint8_t *zip_deflate(const uint8_t *data, size_t len, size_t *out_len)
             z[0] = 0x03, z[1] = 0x00, *out_len = 2;
         return z;
     }
-    int n = 0;
-    /* stb makes a zlib stream: drop its 2-byte header and 4-byte Adler-32 trailer */
-    uint8_t *z = stbi_zlib_compress((unsigned char *)data, (int)len, &n, 8);
-    if (!z || n < 6)
-    {
-        free(z);
-        return NULL;
-    }
-    memmove(z, z + 2, (size_t)n - 6);
-    *out_len = (size_t)n - 6;
+    size_t n = 0;
+    /* stb's zlib stream, without its 2-byte header (or the Adler-32 after it) */
+    uint8_t *z = zlib_compress(data, len, 0, 0, 0, &n);
+    if (z)
+        memmove(z, z + 2, n - 2), *out_len = n - 2;
     return z;
 }
 
